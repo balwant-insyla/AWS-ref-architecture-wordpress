@@ -103,6 +103,22 @@ Parameters:
     MinLength: 12
     MaxLength: 41
     Description: WordPress admin password
+  
+  DatabaseName:
+    Type: String
+    Default: "wordpress"
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    Description: WordPress database name
+  
+  WPTablePrefix:
+    Type: String
+    Default: "wp_"
+    MinLength: 1
+    MaxLength: 10
+    AllowedPattern: ^[a-zA-Z0-9_]*$
+    Description: WordPress table prefix
 
 Conditions:
   HasSSLCertificate: !Not [!Equals [!Ref PublicAlbAcmCertificate, ""]]
@@ -473,7 +489,7 @@ Resources:
     Properties:
       Engine: aurora-mysql
       EngineVersion: 8.0.mysql_aurora.3.05.2
-      DatabaseName: wordpress
+      DatabaseName: !Ref DatabaseName
       MasterUsername: !Ref DatabaseMasterUsername
       MasterUserPassword: !Ref DatabaseMasterPassword
       DBSubnetGroupName: !Ref DBSubnetGroup
@@ -636,15 +652,29 @@ Resources:
             cp -r wordpress/* /var/www/html/ || signal_failure "WordPress copy failed"
             rm -rf wordpress latest.tar.gz
             
-            # Basic WordPress config (without WP-CLI for now)
-            cd /var/www/html
-            cp wp-config-sample.php wp-config.php
+            # Install WP-CLI
+            curl -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+            chmod +x /usr/local/bin/wp
             
-            # Replace database settings
-            sed -i "s/database_name_here/wordpress/g" wp-config.php
-            sed -i "s/username_here/${DatabaseMasterUsername}/g" wp-config.php
-            sed -i "s/password_here/${DatabaseMasterPassword}/g" wp-config.php
-            sed -i "s/localhost/${DatabaseCluster.Endpoint.Address}/g" wp-config.php
+            # Configure WordPress
+            cd /var/www/html
+            
+            # Wait for database to be ready
+            until mysql -h ${DatabaseCluster.Endpoint.Address} -u ${DatabaseMasterUsername} -p${DatabaseMasterPassword} -e "SELECT 1" > /dev/null 2>&1; do
+              echo "Waiting for database..."
+              sleep 10
+            done
+            
+            # Create wp-config.php
+            wp config create --dbname=${DatabaseName} --dbuser=${DatabaseMasterUsername} \
+              --dbpass='${DatabaseMasterPassword}' --dbhost=${DatabaseCluster.Endpoint.Address} \
+              --dbprefix='${WPTablePrefix}' --allow-root
+            
+            # Install WordPress
+            SITE_URL="http://${ApplicationLoadBalancer.DNSName}"
+            wp core install --url="$SITE_URL" --title="${WPTitle}" \
+              --admin_user=${WPAdminUsername} --admin_password='${WPAdminPassword}' \
+              --admin_email=${AdminEmail} --allow-root
             
             # Set permissions
             chown -R apache:apache /var/www/html
