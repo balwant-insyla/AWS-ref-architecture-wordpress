@@ -1,0 +1,242 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Updated WordPress on AWS - Master template with current versions and security best practices
+
+Parameters:
+  EC2KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for instances
+  
+  SshAccessCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    Description: CIDR for SSH access (restricted from 0.0.0.0/0)
+  
+  AdminEmail:
+    Type: String
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    Description: Admin email address
+  
+  WPDomainName:
+    Type: String
+    Default: ""
+    Description: Optional domain name for WordPress site
+  
+  # Database Parameters
+  DatabaseInstanceType:
+    Type: String
+    Default: db.t4g.medium
+    AllowedValues:
+      - db.t4g.micro
+      - db.t4g.small
+      - db.t4g.medium
+      - db.t4g.large
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+    Description: RDS Aurora instance type (current generation)
+  
+  DatabaseMasterUsername:
+    Type: String
+    MinLength: 8
+    MaxLength: 16
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    Description: Database master username
+  
+  DatabaseMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 41
+    AllowedPattern: ^[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{}|;:,.<>?]*$
+    Description: Database master password (min 12 chars)
+  
+  DatabaseName:
+    Type: String
+    Default: wordpress
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    Description: Database name
+  
+  # Web Tier Parameters
+  WebInstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedValues:
+      - t4g.micro
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+      - m6i.large
+      - m6i.xlarge
+    Description: Web tier instance type (current generation)
+  
+  PHPVersion:
+    Type: String
+    Default: "8.3"
+    AllowedValues:
+      - "8.2"
+      - "8.3"
+    Description: PHP version (current supported versions)
+  
+  WPVersion:
+    Type: String
+    Default: "6.4"
+    AllowedValues:
+      - "latest"
+      - "6.4"
+      - "6.3"
+    Description: WordPress version
+  
+  # Cache Parameters
+  ElastiCacheNodeType:
+    Type: String
+    Default: cache.t4g.micro
+    AllowedValues:
+      - cache.t4g.micro
+      - cache.t4g.small
+      - cache.t4g.medium
+      - cache.r7g.large
+      - cache.r7g.xlarge
+    Description: ElastiCache node type (current generation)
+  
+  # Security Parameters
+  PublicAlbAcmCertificate:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for HTTPS (required for production)
+  
+  CloudFrontAcmCertificate:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for CloudFront (us-east-1)
+
+Conditions:
+  HasDomainName: !Not [!Equals [!Ref WPDomainName, ""]]
+  HasSSLCertificate: !Not [!Equals [!Ref PublicAlbAcmCertificate, ""]]
+  HasCloudFrontCert: !Not [!Equals [!Ref CloudFrontAcmCertificate, ""]]
+
+Resources:
+  # VPC Stack
+  VPCStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-01-newvpc-updated.yaml'
+      Parameters:
+        VpcCidr: 10.0.0.0/16
+        NumberOfAZs: 3
+
+  # Security Groups Stack
+  SecurityGroupsStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: VPCStack
+    Properties:
+      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-02-securitygroups-updated.yaml'
+      Parameters:
+        VpcId: !GetAtt VPCStack.Outputs.VpcId
+        SshAccessCidr: !Ref SshAccessCidr
+
+  # RDS Aurora Stack
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [VPCStack, SecurityGroupsStack]
+    Properties:
+      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-rds-updated.yaml'
+      Parameters:
+        DatabaseInstanceType: !Ref DatabaseInstanceType
+        DatabaseMasterUsername: !Ref DatabaseMasterUsername
+        DatabaseMasterPassword: !Ref DatabaseMasterPassword
+        DatabaseName: !Ref DatabaseName
+        DatabaseSecurityGroup: !GetAtt SecurityGroupsStack.Outputs.DatabaseSecurityGroup
+        DataSubnets: !GetAtt VPCStack.Outputs.DataSubnets
+
+  # EFS Stack
+  EFSStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [VPCStack, SecurityGroupsStack]
+    Properties:
+      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-efs-updated.yaml'
+      Parameters:
+        EfsSecurityGroup: !GetAtt SecurityGroupsStack.Outputs.EfsSecurityGroup
+        DataSubnets: !GetAtt VPCStack.Outputs.DataSubnets
+
+  # ElastiCache Stack
+  CacheStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [VPCStack, SecurityGroupsStack]
+    Properties:
+      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-elasticache-updated.yaml'
+      Parameters:
+        ElastiCacheNodeType: !Ref ElastiCacheNodeType
+        ElastiCacheSecurityGroup: !GetAtt SecurityGroupsStack.Outputs.ElastiCacheSecurityGroup
+        DataSubnets: !GetAtt VPCStack.Outputs.DataSubnets
+
+  # Application Load Balancer Stack
+  ALBStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [VPCStack, SecurityGroupsStack]
+    Properties:
+      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-alb-updated.yaml'
+      Parameters:
+        VpcId: !GetAtt VPCStack.Outputs.VpcId
+        PublicSubnets: !GetAtt VPCStack.Outputs.PublicSubnets
+        PublicAlbSecurityGroup: !GetAtt SecurityGroupsStack.Outputs.PublicAlbSecurityGroup
+        PublicAlbAcmCertificate: !Ref PublicAlbAcmCertificate
+
+  # Web Tier Stack
+  WebStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [VPCStack, SecurityGroupsStack, DatabaseStack, EFSStack, CacheStack, ALBStack]
+    Properties:
+      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-04-web-updated.yaml'
+      Parameters:
+        WebInstanceType: !Ref WebInstanceType
+        PHPVersion: !Ref PHPVersion
+        WPVersion: !Ref WPVersion
+        EC2KeyName: !Ref EC2KeyName
+        WebSecurityGroup: !GetAtt SecurityGroupsStack.Outputs.WebSecurityGroup
+        WebSubnets: !GetAtt VPCStack.Outputs.WebSubnets
+        DatabaseEndpoint: !GetAtt DatabaseStack.Outputs.DatabaseEndpoint
+        DatabaseName: !Ref DatabaseName
+        DatabaseMasterUsername: !Ref DatabaseMasterUsername
+        DatabaseMasterPassword: !Ref DatabaseMasterPassword
+        EfsFileSystemId: !GetAtt EFSStack.Outputs.EfsFileSystemId
+        ElastiCacheEndpoint: !GetAtt CacheStack.Outputs.ElastiCacheEndpoint
+        TargetGroupArn: !GetAtt ALBStack.Outputs.TargetGroupArn
+        AdminEmail: !Ref AdminEmail
+        WPDomainName: !Ref WPDomainName
+
+  # CloudFront Stack (Optional)
+  CloudFrontStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasCloudFrontCert
+    DependsOn: [ALBStack, WebStack]
+    Properties:
+      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-04-cloudfront-updated.yaml'
+      Parameters:
+        ALBDomainName: !GetAtt ALBStack.Outputs.ALBDomainName
+        CloudFrontAcmCertificate: !Ref CloudFrontAcmCertificate
+        WPDomainName: !Ref WPDomainName
+
+Outputs:
+  WordPressSiteURL:
+    Description: WordPress Site URL
+    Value: !If
+      - HasCloudFrontCert
+      - !If
+        - HasDomainName
+        - !Sub 'https://${WPDomainName}'
+        - !GetAtt CloudFrontStack.Outputs.CloudFrontURL
+      - !If
+        - HasSSLCertificate
+        - !Sub 'https://${ALBStack.Outputs.ALBDomainName}'
+        - !Sub 'http://${ALBStack.Outputs.ALBDomainName}'
+  
+  DatabaseEndpoint:
+    Description: RDS Aurora Endpoint
+    Value: !GetAtt DatabaseStack.Outputs.DatabaseEndpoint
+  
+  EFSFileSystemId:
+    Description: EFS File System ID
+    Value: !GetAtt EFSStack.Outputs.EfsFileSystemId

@@ -1,0 +1,212 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Updated security groups with least privilege access and current best practices
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID
+  
+  SshAccessCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR for SSH access (should be restricted)
+
+Resources:
+  # ALB Security Group
+  PublicAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-alb-sg'
+      GroupDescription: Security group for public ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from internet
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: HTTP to web servers
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  # Web Security Group
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-web-sg'
+      GroupDescription: Security group for web servers
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref PublicAlbSecurityGroup
+          Description: HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: SSH from bastion
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to internet
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP to internet
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: MySQL to database
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          DestinationSecurityGroupId: !Ref ElastiCacheSecurityGroup
+          Description: Redis to cache
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref EfsSecurityGroup
+          Description: NFS to EFS
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-sg'
+
+  # Bastion Security Group
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-bastion-sg'
+      GroupDescription: Security group for bastion host
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshAccessCidr
+          Description: SSH from restricted CIDR
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          DestinationSecurityGroupId: !Ref WebSecurityGroup
+          Description: SSH to web servers
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to internet
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-sg'
+
+  # Database Security Group
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-db-sg'
+      GroupDescription: Security group for RDS database
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: MySQL from web servers
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: MySQL from bastion (for admin)
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-sg'
+
+  # ElastiCache Security Group
+  ElastiCacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-cache-sg'
+      GroupDescription: Security group for ElastiCache
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: Redis from web servers
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cache-sg'
+
+  # EFS Security Group
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-efs-sg'
+      GroupDescription: Security group for EFS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: NFS from web servers
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-efs-sg'
+
+Outputs:
+  PublicAlbSecurityGroup:
+    Description: Public ALB security group ID
+    Value: !Ref PublicAlbSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicAlbSecurityGroup'
+  
+  WebSecurityGroup:
+    Description: Web security group ID
+    Value: !Ref WebSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSecurityGroup'
+  
+  BastionSecurityGroup:
+    Description: Bastion security group ID
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BastionSecurityGroup'
+  
+  DatabaseSecurityGroup:
+    Description: Database security group ID
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecurityGroup'
+  
+  ElastiCacheSecurityGroup:
+    Description: ElastiCache security group ID
+    Value: !Ref ElastiCacheSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ElastiCacheSecurityGroup'
+  
+  EfsSecurityGroup:
+    Description: EFS security group ID
+    Value: !Ref EfsSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EfsSecurityGroup'

@@ -1,0 +1,184 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Updated RDS Aurora MySQL 8.0 cluster with current best practices
+
+Parameters:
+  DatabaseInstanceType:
+    Type: String
+    Default: db.t4g.medium
+    Description: Aurora instance type
+  
+  DatabaseMasterUsername:
+    Type: String
+    MinLength: 8
+    MaxLength: 16
+    Description: Database master username
+  
+  DatabaseMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 41
+    Description: Database master password
+  
+  DatabaseName:
+    Type: String
+    Default: wordpress
+    Description: Database name
+  
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Database security group
+  
+  DataSubnets:
+    Type: CommaDelimitedList
+    Description: Data subnet IDs
+
+Resources:
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora cluster
+      SubnetIds: !Ref DataSubnets
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-subnet-group'
+
+  # Aurora Cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: aurora-mysql
+      EngineVersion: 8.0.mysql_aurora.3.05.2
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: !Ref DatabaseMasterUsername
+      MasterUserPassword: !Ref DatabaseMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: 30
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      StorageEncrypted: true
+      DeletionProtection: true
+      EnableCloudwatchLogsExports:
+        - error
+        - general
+        - slowquery
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 16
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-cluster'
+
+  # Aurora Instance 1
+  AuroraInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: !Ref DatabaseInstanceType
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt EnhancedMonitoringRole.Arn
+      PerformanceInsightsEnabled: true
+      PerformanceInsightsRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-instance-1'
+
+  # Aurora Instance 2 (Read Replica)
+  AuroraInstance2:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: !Ref DatabaseInstanceType
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt EnhancedMonitoringRole.Arn
+      PerformanceInsightsEnabled: true
+      PerformanceInsightsRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-instance-2'
+
+  # Enhanced Monitoring Role
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole'
+      Path: /
+
+  # CloudWatch Alarms
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU utilization
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions:
+        - !Ref DatabaseAlarmTopic
+
+  DatabaseConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database connection count
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions:
+        - !Ref DatabaseAlarmTopic
+
+  # SNS Topic for Alarms
+  DatabaseAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-database-alarms'
+
+Outputs:
+  DatabaseEndpoint:
+    Description: Aurora cluster endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+  
+  DatabasePort:
+    Description: Aurora cluster port
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+  
+  DatabaseName:
+    Description: Database name
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'

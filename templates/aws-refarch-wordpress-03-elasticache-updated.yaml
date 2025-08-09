@@ -1,0 +1,149 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Updated ElastiCache Redis cluster with current generation instances
+
+Parameters:
+  ElastiCacheNodeType:
+    Type: String
+    Default: cache.t4g.micro
+    AllowedValues:
+      - cache.t4g.micro
+      - cache.t4g.small
+      - cache.t4g.medium
+      - cache.r7g.large
+      - cache.r7g.xlarge
+      - cache.r7g.2xlarge
+    Description: ElastiCache node type (current generation)
+  
+  ElastiCacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ElastiCache security group
+  
+  DataSubnets:
+    Type: CommaDelimitedList
+    Description: Data subnet IDs
+
+Resources:
+  # ElastiCache Subnet Group
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for ElastiCache
+      SubnetIds: !Ref DataSubnets
+      CacheSubnetGroupName: !Sub '${AWS::StackName}-cache-subnet-group'
+
+  # ElastiCache Parameter Group
+  ElastiCacheParameterGroup:
+    Type: AWS::ElastiCache::ParameterGroup
+    Properties:
+      CacheParameterGroupFamily: redis7.x
+      Description: Parameter group for Redis 7.x
+      Properties:
+        maxmemory-policy: allkeys-lru
+        timeout: 300
+        tcp-keepalive: 300
+
+  # ElastiCache Replication Group
+  ElastiCacheReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub '${AWS::StackName}-redis'
+      Description: Redis cluster for WordPress caching
+      Engine: redis
+      EngineVersion: 7.0
+      CacheNodeType: !Ref ElastiCacheNodeType
+      NumCacheClusters: 2
+      Port: 6379
+      CacheParameterGroupName: !Ref ElastiCacheParameterGroup
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref ElastiCacheSecurityGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      MultiAZEnabled: true
+      AutomaticFailoverEnabled: true
+      PreferredMaintenanceWindow: sun:03:00-sun:04:00
+      SnapshotRetentionLimit: 7
+      SnapshotWindow: 02:00-03:00
+      NotificationTopicArn: !Ref CacheAlarmTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-redis-cluster'
+
+  # CloudWatch Alarms
+  CacheCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Cache CPU utilization too high
+      MetricName: CPUUtilization
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 75
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub '${AWS::StackName}-redis-001'
+      AlarmActions:
+        - !Ref CacheAlarmTopic
+
+  CacheMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Cache memory utilization too high
+      MetricName: DatabaseMemoryUsagePercentage
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub '${AWS::StackName}-redis-001'
+      AlarmActions:
+        - !Ref CacheAlarmTopic
+
+  CacheEvictionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Cache evictions too high
+      MetricName: Evictions
+      Namespace: AWS/ElastiCache
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub '${AWS::StackName}-redis-001'
+      AlarmActions:
+        - !Ref CacheAlarmTopic
+
+  # SNS Topic for Alarms
+  CacheAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-cache-alarms'
+
+Outputs:
+  ElastiCacheEndpoint:
+    Description: ElastiCache primary endpoint
+    Value: !GetAtt ElastiCacheReplicationGroup.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ElastiCacheEndpoint'
+  
+  ElastiCachePort:
+    Description: ElastiCache port
+    Value: !GetAtt ElastiCacheReplicationGroup.PrimaryEndPoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-ElastiCachePort'
+  
+  ElastiCacheReaderEndpoint:
+    Description: ElastiCache reader endpoint
+    Value: !GetAtt ElastiCacheReplicationGroup.ReaderEndPoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ElastiCacheReaderEndpoint'

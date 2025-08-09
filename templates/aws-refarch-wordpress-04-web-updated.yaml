@@ -1,0 +1,361 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Updated WordPress web tier with current PHP/WordPress versions and security best practices
+
+Parameters:
+  WebInstanceType:
+    Type: String
+    Default: t4g.medium
+    Description: Web instance type
+  
+  PHPVersion:
+    Type: String
+    Default: "8.3"
+    AllowedValues: ["8.2", "8.3"]
+    Description: PHP version
+  
+  WPVersion:
+    Type: String
+    Default: "6.4"
+    Description: WordPress version
+  
+  EC2KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair
+  
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Web security group
+  
+  WebSubnets:
+    Type: CommaDelimitedList
+    Description: Web subnet IDs
+  
+  DatabaseEndpoint:
+    Type: String
+    Description: Database endpoint
+  
+  DatabaseName:
+    Type: String
+    Description: Database name
+  
+  DatabaseMasterUsername:
+    Type: String
+    Description: Database username
+  
+  DatabaseMasterPassword:
+    Type: String
+    NoEcho: true
+    Description: Database password
+  
+  EfsFileSystemId:
+    Type: String
+    Description: EFS file system ID
+  
+  ElastiCacheEndpoint:
+    Type: String
+    Description: ElastiCache endpoint
+  
+  TargetGroupArn:
+    Type: String
+    Description: ALB target group ARN
+  
+  AdminEmail:
+    Type: String
+    Description: WordPress admin email
+  
+  WPDomainName:
+    Type: String
+    Default: ""
+    Description: WordPress domain name
+
+Conditions:
+  HasDomainName: !Not [!Equals [!Ref WPDomainName, ""]]
+
+Resources:
+  # IAM Role for Web Instances
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EFSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EfsFileSystemId}'
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebInstanceRole
+
+  # Launch Template
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-web-template'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: !Ref WebInstanceType
+        KeyName: !Ref EC2KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt WebInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            
+            # Update system
+            dnf update -y
+            
+            # Install required packages
+            dnf install -y httpd mariadb105 php${PHPVersion} php${PHPVersion}-mysqlnd php${PHPVersion}-opcache \
+                          php${PHPVersion}-gd php${PHPVersion}-xml php${PHPVersion}-mbstring php${PHPVersion}-json \
+                          php${PHPVersion}-curl php${PHPVersion}-zip amazon-efs-utils amazon-cloudwatch-agent
+            
+            # Configure PHP
+            sed -i 's/memory_limit = .*/memory_limit = 256M/' /etc/php.ini
+            sed -i 's/upload_max_filesize = .*/upload_max_filesize = 64M/' /etc/php.ini
+            sed -i 's/post_max_size = .*/post_max_size = 64M/' /etc/php.ini
+            sed -i 's/max_execution_time = .*/max_execution_time = 300/' /etc/php.ini
+            
+            # Configure OPcache
+            cat >> /etc/php.d/10-opcache.ini << EOF
+            opcache.memory_consumption=256
+            opcache.interned_strings_buffer=8
+            opcache.max_accelerated_files=4000
+            opcache.revalidate_freq=2
+            opcache.fast_shutdown=1
+            opcache.enable_cli=1
+            EOF
+            
+            # Mount EFS
+            mkdir -p /var/www/wordpress
+            echo "${EfsFileSystemId}.efs.${AWS::Region}.amazonaws.com:/ /var/www/wordpress efs defaults,_netdev,tls" >> /etc/fstab
+            mount -a
+            
+            # Configure Apache
+            cat > /etc/httpd/conf.d/wordpress.conf << EOF
+            <VirtualHost *:80>
+                DocumentRoot /var/www/wordpress
+                <Directory /var/www/wordpress>
+                    Options Indexes FollowSymLinks
+                    AllowOverride All
+                    Require all granted
+                </Directory>
+                ErrorLog /var/log/httpd/wordpress_error.log
+                CustomLog /var/log/httpd/wordpress_access.log combined
+            </VirtualHost>
+            EOF
+            
+            # Install WordPress CLI
+            curl -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+            chmod +x /usr/local/bin/wp
+            
+            # Install WordPress
+            cd /var/www/wordpress
+            if [ ! -f wp-config.php ]; then
+                wp core download --version=${WPVersion} --allow-root
+                wp config create --dbname=${DatabaseName} --dbuser=${DatabaseMasterUsername} \
+                   --dbpass='${DatabaseMasterPassword}' --dbhost=${DatabaseEndpoint} --allow-root
+                
+                # Configure WordPress for load balancer
+                cat >> wp-config.php << 'WPEOF'
+            
+            // Load balancer configuration
+            if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+                $_SERVER['HTTPS'] = 'on';
+            }
+            
+            define('WP_HOME', 'http' . (isset($_SERVER['HTTPS']) ? 's' : '') . '://' . $_SERVER['HTTP_HOST']);
+            define('WP_SITEURL', WP_HOME);
+            
+            // Redis cache configuration
+            define('WP_REDIS_HOST', '${ElastiCacheEndpoint}');
+            define('WP_REDIS_PORT', 6379);
+            define('WP_REDIS_DATABASE', 0);
+            WPEOF
+                
+                # Install WordPress
+                SITE_URL="${!If [HasDomainName, !Sub 'https://${WPDomainName}', 'http://localhost']}"
+                wp core install --url="$SITE_URL" --title="WordPress on AWS" \
+                   --admin_user=admin --admin_password='${DatabaseMasterPassword}' \
+                   --admin_email=${AdminEmail} --allow-root
+                
+                # Install and activate plugins
+                wp plugin install redis-cache --activate --allow-root
+                wp plugin install w3-total-cache --activate --allow-root
+                
+                # Set permissions
+                chown -R apache:apache /var/www/wordpress
+                find /var/www/wordpress -type d -exec chmod 755 {} \;
+                find /var/www/wordpress -type f -exec chmod 644 {} \;
+            fi
+            
+            # Start services
+            systemctl enable httpd
+            systemctl start httpd
+            
+            # Configure CloudWatch agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
+            {
+                "logs": {
+                    "logs_collected": {
+                        "files": {
+                            "collect_list": [
+                                {
+                                    "file_path": "/var/log/httpd/wordpress_error.log",
+                                    "log_group_name": "/aws/ec2/wordpress/apache/error",
+                                    "log_stream_name": "{instance_id}"
+                                },
+                                {
+                                    "file_path": "/var/log/httpd/wordpress_access.log",
+                                    "log_group_name": "/aws/ec2/wordpress/apache/access",
+                                    "log_stream_name": "{instance_id}"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "metrics": {
+                    "namespace": "WordPress/EC2",
+                    "metrics_collected": {
+                        "cpu": {
+                            "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                            "metrics_collection_interval": 60
+                        },
+                        "disk": {
+                            "measurement": ["used_percent"],
+                            "metrics_collection_interval": 60,
+                            "resources": ["*"]
+                        },
+                        "mem": {
+                            "measurement": ["mem_used_percent"],
+                            "metrics_collection_interval": 60
+                        }
+                    }
+                }
+            }
+            EOF
+            
+            systemctl enable amazon-cloudwatch-agent
+            systemctl start amazon-cloudwatch-agent
+            
+            # Signal completion
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 6
+      DesiredCapacity: 2
+      VPCZoneIdentifier: !Ref WebSubnets
+      TargetGroupARNs:
+        - !Ref TargetGroupArn
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-instance'
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: 2
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+
+  # Scaling Policies
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: 1
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: -1
+
+  # CloudWatch Alarms
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale up on high CPU
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale down on low CPU
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+
+Outputs:
+  AutoScalingGroupName:
+    Description: Auto Scaling Group Name
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroup'

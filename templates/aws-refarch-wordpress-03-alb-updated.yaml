@@ -1,0 +1,182 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Updated Application Load Balancer with HTTPS and security best practices
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID
+  
+  PublicSubnets:
+    Type: CommaDelimitedList
+    Description: Public subnet IDs
+  
+  PublicAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ALB security group
+  
+  PublicAlbAcmCertificate:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for HTTPS
+
+Conditions:
+  HasSSLCertificate: !Not [!Equals [!Ref PublicAlbAcmCertificate, ""]]
+
+Resources:
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnets
+      SecurityGroups:
+        - !Ref PublicAlbSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+        - Key: deletion_protection.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+
+  # Target Group
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200,301,302'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: 'lb_cookie'
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-tg'
+
+  # HTTPS Listener (when certificate is provided)
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasSSLCertificate
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref PublicAlbAcmCertificate
+      SslPolicy: ELBSecurityPolicy-TLS-1-2-2017-01
+
+  # HTTP Listener (redirects to HTTPS when certificate is provided)
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - !If
+          - HasSSLCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: 443
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # CloudWatch Alarms
+  TargetResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Target response time too high
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      AlarmActions:
+        - !Ref ALBAlarmTopic
+
+  UnhealthyHostCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Unhealthy host count too high
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      AlarmActions:
+        - !Ref ALBAlarmTopic
+
+  # SNS Topic for Alarms
+  ALBAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alb-alarms'
+
+Outputs:
+  ALBDomainName:
+    Description: ALB DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBDomainName'
+  
+  ALBHostedZoneId:
+    Description: ALB hosted zone ID
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBHostedZoneId'
+  
+  TargetGroupArn:
+    Description: Target group ARN
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetGroupArn'
+  
+  LoadBalancerArn:
+    Description: Load balancer ARN
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerArn'
