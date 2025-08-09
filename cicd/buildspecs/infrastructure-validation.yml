@@ -1,0 +1,66 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.8
+    commands:
+      - echo "Installing validation tools..."
+      - pip install cfn-lint
+      - pip install cfn-nag
+      - curl -L https://github.com/stelligent/cfn_nag/releases/latest/download/cfn_nag-0.8.10.gem -o cfn_nag.gem
+      
+  pre_build:
+    commands:
+      - echo "Starting CloudFormation template validation..."
+      - echo "Build started on `date`"
+      
+  build:
+    commands:
+      - echo "Validating CloudFormation templates..."
+      
+      # Lint all YAML templates
+      - |
+        for template in templates/*.yaml; do
+          if [ -f "$template" ]; then
+            echo "Linting $template..."
+            cfn-lint "$template"
+          fi
+        done
+      
+      # Validate main WordPress template
+      - |
+        if [ -f "templates/wordpress-complete-single-file.yaml" ]; then
+          echo "Validating WordPress template..."
+          aws cloudformation validate-template \
+            --template-body file://templates/wordpress-complete-single-file.yaml
+        fi
+      
+      # Security validation (if cfn_nag is available)
+      - |
+        if command -v cfn_nag &> /dev/null; then
+          echo "Running security validation..."
+          cfn_nag_scan --input-path templates/
+        fi
+      
+      # Check for best practices
+      - |
+        echo "Checking for AWS best practices..."
+        grep -r "DeletionPolicy" templates/ || echo "Warning: Consider adding DeletionPolicy for critical resources"
+        grep -r "Encrypted.*true" templates/ && echo "Good: Encryption enabled for resources"
+        
+  post_build:
+    commands:
+      - echo "Template validation completed on `date`"
+      - |
+        if [ $CODEBUILD_BUILD_SUCCEEDING -eq 1 ]; then
+          echo "✅ All validations passed successfully!"
+        else
+          echo "❌ Validation failed. Please check the logs above."
+        fi
+
+artifacts:
+  files:
+    - templates/**/*
+    - cicd/**/*
+  name: validated-templates

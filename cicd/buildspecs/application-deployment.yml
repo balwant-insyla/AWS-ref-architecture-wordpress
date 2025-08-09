@@ -1,0 +1,145 @@
+version: 0.2
+
+env:
+  variables:
+    WORDPRESS_VERSION: "latest"
+    PHP_VERSION: "8.2"
+
+phases:
+  install:
+    runtime-versions:
+      php: 8.0
+      nodejs: 14
+    commands:
+      - echo "Installing deployment tools..."
+      - curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+      - chmod +x wp-cli.phar
+      - mv wp-cli.phar /usr/local/bin/wp
+      - yum install -y rsync
+      
+  pre_build:
+    commands:
+      - echo "Preparing WordPress application deployment..."
+      - echo "Environment: $ENVIRONMENT"
+      - echo "Build started on `date`"
+      
+      # Get target infrastructure details
+      - |
+        if [ "$ENVIRONMENT" ]; then
+          STACK_NAME="wordpress-$ENVIRONMENT"
+          echo "Target stack: $STACK_NAME"
+          
+          # Get EFS ID from CloudFormation stack
+          EFS_ID=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query 'Stacks[0].Outputs[?OutputKey==`EFSFileSystemId`].OutputValue' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ "$EFS_ID" ]; then
+            echo "Target EFS: $EFS_ID"
+          else
+            echo "Warning: Could not retrieve EFS ID from stack"
+          fi
+        fi
+      
+  build:
+    commands:
+      - echo "Building WordPress application..."
+      
+      # Validate WordPress structure
+      - |
+        if [ -f "wp-config-sample.php" ] || [ -f "wp-config.php" ]; then
+          echo "✅ WordPress core files detected"
+        else
+          echo "ℹ️  No WordPress core files found - this might be a theme/plugin only deployment"
+        fi
+      
+      # Check for custom themes
+      - |
+        if [ -d "wp-content/themes" ]; then
+          echo "✅ Custom themes detected:"
+          ls -la wp-content/themes/
+        fi
+      
+      # Check for custom plugins
+      - |
+        if [ -d "wp-content/plugins" ]; then
+          echo "✅ Custom plugins detected:"
+          ls -la wp-content/plugins/
+        fi
+      
+      # Validate PHP syntax for custom code
+      - |
+        echo "Validating PHP syntax..."
+        find . -name "*.php" -exec php -l {} \; | grep -v "No syntax errors"
+      
+      # Check for security issues
+      - |
+        echo "Checking for common security issues..."
+        
+        # Check for hardcoded credentials
+        if grep -r "password.*=" --include="*.php" . | grep -v "wp-config-sample.php"; then
+          echo "⚠️  Warning: Potential hardcoded passwords found"
+        fi
+        
+        # Check for debug mode
+        if grep -r "WP_DEBUG.*true" --include="*.php" .; then
+          echo "⚠️  Warning: Debug mode enabled - disable for production"
+        fi
+      
+      # Prepare deployment package
+      - |
+        echo "Preparing deployment package..."
+        mkdir -p deployment-package
+        
+        # Copy WordPress files (excluding sensitive files)
+        rsync -av --exclude='.git' \
+                  --exclude='node_modules' \
+                  --exclude='.env' \
+                  --exclude='wp-config.php' \
+                  . deployment-package/
+        
+        # Create deployment manifest
+        cat > deployment-package/deployment-manifest.json << EOF
+        {
+          "deployment_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "environment": "$ENVIRONMENT",
+          "build_number": "$CODEBUILD_BUILD_NUMBER",
+          "commit_id": "$CODEBUILD_RESOLVED_SOURCE_VERSION",
+          "wordpress_version": "$WORDPRESS_VERSION",
+          "php_version": "$PHP_VERSION"
+        }
+        EOF
+        
+  post_build:
+    commands:
+      - echo "Application build completed on `date`"
+      
+      # Generate deployment summary
+      - |
+        echo "📋 Deployment Summary:"
+        echo "  Environment: $ENVIRONMENT"
+        echo "  Build Number: $CODEBUILD_BUILD_NUMBER"
+        echo "  Commit: $CODEBUILD_RESOLVED_SOURCE_VERSION"
+        
+        if [ -d "wp-content/themes" ]; then
+          THEME_COUNT=$(find wp-content/themes -maxdepth 1 -type d | wc -l)
+          echo "  Custom Themes: $((THEME_COUNT - 1))"
+        fi
+        
+        if [ -d "wp-content/plugins" ]; then
+          PLUGIN_COUNT=$(find wp-content/plugins -maxdepth 1 -type d | wc -l)
+          echo "  Custom Plugins: $((PLUGIN_COUNT - 1))"
+        fi
+      
+      - |
+        if [ $CODEBUILD_BUILD_SUCCEEDING -eq 1 ]; then
+          echo "✅ Application build completed successfully!"
+        else
+          echo "❌ Application build failed. Please check the logs above."
+        fi
+
+artifacts:
+  files:
+    - deployment-package/**/*
+  name: wordpress-application-$(date +%Y%m%d-%H%M%S)
