@@ -122,7 +122,7 @@ Resources:
   VPCStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-01-newvpc-updated.yaml'
+      TemplateURL: 'https://raw.githubusercontent.com/YOUR-USERNAME/YOUR-REPO/main/templates/aws-refarch-wordpress-01-newvpc-updated.yaml'
       Parameters:
         VpcCidr: 10.0.0.0/16
         NumberOfAZs: 3
@@ -132,7 +132,7 @@ Resources:
     Type: AWS::CloudFormation::Stack
     DependsOn: VPCStack
     Properties:
-      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-02-securitygroups-updated.yaml'
+      TemplateURL: 'https://raw.githubusercontent.com/YOUR-USERNAME/YOUR-REPO/main/templates/aws-refarch-wordpress-02-securitygroups-updated.yaml'
       Parameters:
         VpcId: !GetAtt VPCStack.Outputs.VpcId
         SshAccessCidr: !Ref SshAccessCidr
@@ -142,7 +142,7 @@ Resources:
     Type: AWS::CloudFormation::Stack
     DependsOn: [VPCStack, SecurityGroupsStack]
     Properties:
-      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-rds-updated.yaml'
+      TemplateURL: 'https://raw.githubusercontent.com/YOUR-USERNAME/YOUR-REPO/main/templates/aws-refarch-wordpress-03-rds-updated.yaml'
       Parameters:
         DatabaseInstanceType: !Ref DatabaseInstanceType
         DatabaseMasterUsername: !Ref DatabaseMasterUsername
@@ -156,7 +156,7 @@ Resources:
     Type: AWS::CloudFormation::Stack
     DependsOn: [VPCStack, SecurityGroupsStack]
     Properties:
-      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-efs-updated.yaml'
+      TemplateURL: 'https://raw.githubusercontent.com/YOUR-USERNAME/YOUR-REPO/main/templates/aws-refarch-wordpress-03-efs-updated.yaml'
       Parameters:
         EfsSecurityGroup: !GetAtt SecurityGroupsStack.Outputs.EfsSecurityGroup
         DataSubnets: !GetAtt VPCStack.Outputs.DataSubnets
@@ -166,7 +166,7 @@ Resources:
     Type: AWS::CloudFormation::Stack
     DependsOn: [VPCStack, SecurityGroupsStack]
     Properties:
-      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-elasticache-updated.yaml'
+      TemplateURL: 'https://raw.githubusercontent.com/YOUR-USERNAME/YOUR-REPO/main/templates/aws-refarch-wordpress-03-elasticache-updated.yaml'
       Parameters:
         ElastiCacheNodeType: !Ref ElastiCacheNodeType
         ElastiCacheSecurityGroup: !GetAtt SecurityGroupsStack.Outputs.ElastiCacheSecurityGroup
@@ -177,7 +177,7 @@ Resources:
     Type: AWS::CloudFormation::Stack
     DependsOn: [VPCStack, SecurityGroupsStack]
     Properties:
-      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-alb-updated.yaml'
+      TemplateURL: 'https://raw.githubusercontent.com/YOUR-USERNAME/YOUR-REPO/main/templates/aws-refarch-wordpress-03-alb-updated.yaml'
       Parameters:
         VpcId: !GetAtt VPCStack.Outputs.VpcId
         PublicSubnets: !GetAtt VPCStack.Outputs.PublicSubnets
@@ -189,7 +189,7 @@ Resources:
     Type: AWS::CloudFormation::Stack
     DependsOn: [VPCStack, SecurityGroupsStack, DatabaseStack, EFSStack, CacheStack, ALBStack]
     Properties:
-      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-04-web-updated.yaml'
+      TemplateURL: 'https://raw.githubusercontent.com/YOUR-USERNAME/YOUR-REPO/main/templates/aws-refarch-wordpress-04-web-updated.yaml'
       Parameters:
         WebInstanceType: !Ref WebInstanceType
         PHPVersion: !Ref PHPVersion
@@ -213,7 +213,7 @@ Resources:
     Condition: HasCloudFrontCert
     DependsOn: [ALBStack, WebStack]
     Properties:
-      TemplateURL: !Sub 'https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-04-cloudfront-updated.yaml'
+      TemplateURL: 'https://raw.githubusercontent.com/YOUR-USERNAME/YOUR-REPO/main/templates/aws-refarch-wordpress-04-cloudfront-updated.yaml'
       Parameters:
         ALBDomainName: !GetAtt ALBStack.Outputs.ALBDomainName
         CloudFrontAcmCertificate: !Ref CloudFrontAcmCertificate
