@@ -1006,7 +1006,7 @@ Resources:
         - !Ref PublicSubnet2
       Tags:
         - Key: Name
-          Value: !Sub '${AWS::StackName}-bastion'
+          Value: !Sub '${AWS::StackName}-bastion-server'
           PropagateAtLaunch: true
 
 Outputs:
