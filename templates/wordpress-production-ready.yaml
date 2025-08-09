@@ -1,0 +1,1630 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Production-Ready WordPress on AWS - Complete reference architecture with all AWS best practices
+
+Parameters:
+  EC2KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for instances
+  
+  AdminEmail:
+    Type: String
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    Description: Admin email address for notifications
+  
+  DatabaseMasterUsername:
+    Type: String
+    MinLength: 8
+    MaxLength: 16
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    Description: Database master username
+  
+  DatabaseMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 41
+    AllowedPattern: ^[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{}|;:,.<>?]*$
+    Description: Database master password (min 12 chars)
+  
+  WPAdminUsername:
+    Type: String
+    Default: "wpadmin"
+    MinLength: 4
+    MaxLength: 16
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    Description: WordPress admin username (avoid 'admin')
+  
+  WPAdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 41
+    Description: WordPress admin password
+  
+  WPTitle:
+    Type: String
+    Default: "WordPress on AWS"
+    Description: WordPress site title
+  
+  # Production Instance Types
+  WebInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m6i.large
+      - m6i.xlarge
+      - c6i.large
+      - c6i.xlarge
+    Description: Web tier instance type (production recommended t3.medium+)
+  
+  DatabaseInstanceType:
+    Type: String
+    Default: db.r6g.large
+    AllowedValues:
+      - db.t4g.medium
+      - db.t4g.large
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+    Description: RDS Aurora instance type (production recommended r6g.large+)
+  
+  CacheNodeType:
+    Type: String
+    Default: cache.r7g.large
+    AllowedValues:
+      - cache.t4g.medium
+      - cache.r7g.large
+      - cache.r7g.xlarge
+      - cache.r7g.2xlarge
+    Description: ElastiCache node type (production recommended r7g.large+)
+  
+  # SSL/TLS Certificates
+  PublicAlbAcmCertificate:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for ALB HTTPS (same region)
+  
+  CloudFrontAcmCertificate:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for CloudFront (us-east-1 only)
+  
+  WPDomainName:
+    Type: String
+    Default: ""
+    Description: Domain name for WordPress site (e.g., example.com)
+  
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: "production"
+    AllowedValues: ["development", "staging", "production"]
+    Description: Environment type
+  
+  # Backup Configuration
+  DatabaseBackupRetentionPeriod:
+    Type: Number
+    Default: 30
+    MinValue: 7
+    MaxValue: 35
+    Description: Database backup retention period (days)
+
+Conditions:
+  HasSSLCertificate: !Not [!Equals [!Ref PublicAlbAcmCertificate, ""]]
+  HasCloudFrontCert: !Not [!Equals [!Ref CloudFrontAcmCertificate, ""]]
+  HasDomainName: !Not [!Equals [!Ref WPDomainName, ""]]
+  IsProduction: !Equals [!Ref Environment, "production"]
+
+Resources:
+  # VPC with Flow Logs for Production
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # VPC Flow Logs for Security Monitoring
+  VPCFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: flowlogsDeliveryRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${AWS::StackName}'
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogRole.Arn
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets (Multi-AZ)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.200.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.201.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-2'
+
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.202.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-3'
+
+  # Web Subnets (Private)
+  WebSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/22
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-1'
+
+  WebSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/22
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-2'
+
+  WebSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.8.0/22
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-3'
+
+  # Data Subnets (Private)
+  DataSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.100.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-1'
+
+  DataSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.101.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-2'
+
+  DataSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.102.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-3'
+
+  # NAT Gateways (Multi-AZ for High Availability)
+  NATGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip-1'
+
+  NATGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip-2'
+
+  NATGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-1'
+
+  NATGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-2'
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  WebRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-rt-1'
+
+  WebRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-rt-2'
+
+  DataRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-rt'
+
+  # Routes
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  WebRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref WebRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway1
+
+  WebRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref WebRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway2
+
+  DataRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref DataRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway1
+
+  # Route Table Associations
+  PublicSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation3:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet3
+      RouteTableId: !Ref PublicRouteTable
+
+  WebSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WebSubnet1
+      RouteTableId: !Ref WebRouteTable1
+
+  WebSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WebSubnet2
+      RouteTableId: !Ref WebRouteTable2
+
+  WebSubnetRouteTableAssociation3:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WebSubnet3
+      RouteTableId: !Ref WebRouteTable1
+
+  DataSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnet1
+      RouteTableId: !Ref DataRouteTable
+
+  DataSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnet2
+      RouteTableId: !Ref DataRouteTable
+
+  DataSubnetRouteTableAssociation3:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnet3
+      RouteTableId: !Ref DataRouteTable
+
+  # Security Groups with Production Best Practices
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB Security Group - Production
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from internet
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          DestinationSecurityGroupId: !Ref WebSecurityGroup
+          Description: HTTP to web servers
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web Security Group - Production
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: SSH from bastion only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to internet
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP to internet
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: MySQL to database
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          DestinationSecurityGroupId: !Ref CacheSecurityGroup
+          Description: Redis to cache
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref EFSSecurityGroup
+          Description: NFS to EFS
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-sg'
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bastion Security Group - Production
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH from internet (restrict this to your IP)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          DestinationSecurityGroupId: !Ref WebSecurityGroup
+          Description: SSH to web servers
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: MySQL to database
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to internet
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-sg'
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database Security Group - Production
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: MySQL from web servers
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: MySQL from bastion
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-sg'
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cache Security Group - Production
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: Redis from web servers
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cache-sg'
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS Security Group - Production
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: NFS from web servers
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-efs-sg'
+
+  # Production-Grade Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+        - !Ref PublicSubnet3
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref ALBLogsBucket
+        - Key: deletion_protection.enabled
+          Value: !If [IsProduction, 'true', 'false']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket for ALB Access Logs
+  ALBLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-alb-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  ALBLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ALBLogsBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::Region}:root'
+            Action: s3:PutObject
+            Resource: !Sub '${ALBLogsBucket}/*'
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /health-check.php
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: 'lb_cookie'
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-tg'
+
+  # HTTPS Listener (Production requires HTTPS)
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasSSLCertificate
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref PublicAlbAcmCertificate
+      SslPolicy: ELBSecurityPolicy-TLS-1-2-2017-01
+
+  # HTTP Listener (redirects to HTTPS)
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - !If
+          - HasSSLCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: 443
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Production RDS Aurora MySQL Cluster
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora cluster
+      SubnetIds:
+        - !Ref DataSubnet1
+        - !Ref DataSubnet2
+        - !Ref DataSubnet3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-subnet-group'
+
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: aurora-mysql
+      EngineVersion: 8.0.mysql_aurora.3.05.2
+      DatabaseName: wordpress
+      MasterUsername: !Ref DatabaseMasterUsername
+      MasterUserPassword: !Ref DatabaseMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: !Ref DatabaseBackupRetentionPeriod
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      StorageEncrypted: true
+      DeletionProtection: !If [IsProduction, true, false]
+      EnableCloudwatchLogsExports:
+        - error
+        - general
+        - slowquery
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt EnhancedMonitoringRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: !Ref DatabaseInstanceType
+      DBClusterIdentifier: !Ref DatabaseCluster
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt EnhancedMonitoringRole.Arn
+      PerformanceInsightsEnabled: true
+      PerformanceInsightsRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-instance-1'
+
+  DatabaseInstance2:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: !Ref DatabaseInstanceType
+      DBClusterIdentifier: !Ref DatabaseCluster
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt EnhancedMonitoringRole.Arn
+      PerformanceInsightsEnabled: true
+      PerformanceInsightsRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-instance-2'
+
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # Production ElastiCache Redis Cluster
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for ElastiCache
+      SubnetIds:
+        - !Ref DataSubnet1
+        - !Ref DataSubnet2
+        - !Ref DataSubnet3
+
+  CacheParameterGroup:
+    Type: AWS::ElastiCache::ParameterGroup
+    Properties:
+      CacheParameterGroupFamily: redis7.x
+      Description: Parameter group for Redis 7.x
+      Properties:
+        maxmemory-policy: allkeys-lru
+        timeout: 300
+
+  CacheReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub '${AWS::StackName}-redis'
+      Description: Redis cluster for WordPress caching
+      Engine: redis
+      EngineVersion: 7.0
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheClusters: 2
+      Port: 6379
+      CacheParameterGroupName: !Ref CacheParameterGroup
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      MultiAZEnabled: true
+      AutomaticFailoverEnabled: true
+      PreferredMaintenanceWindow: sun:03:00-sun:04:00
+      SnapshotRetentionLimit: 7
+      SnapshotWindow: 02:00-03:00
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-redis-cluster'
+
+  # Production EFS File System
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: provisioned
+      ProvisionedThroughputInMibps: 100
+      BackupPolicy:
+        Status: ENABLED
+      LifecyclePolicyTransitionToIA: AFTER_30_DAYS
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-efs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref DataSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref DataSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref DataSubnet3
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # Production WAF Web ACL
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${AWS::StackName}-web-acl'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSetMetric
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputsRuleSetMetric
+        - Name: AWSManagedRulesWordPressRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesWordPressRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: WordPressRuleSetMetric
+        - Name: RateLimitRule
+          Priority: 4
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitMetric
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${AWS::StackName}-web-acl'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-acl'
+
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref ApplicationLoadBalancer
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # Production IAM Roles
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EFSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EFSFileSystem}'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${S3MediaBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref S3MediaBucket
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebInstanceRole
+
+  # S3 Bucket for Media Files (Optional)
+  S3MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-media-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # Production Launch Template
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-web-template'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: !Ref WebInstanceType
+        KeyName: !Ref EC2KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt WebInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        Monitoring:
+          Enabled: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            
+            # Update system
+            dnf update -y
+            
+            # Install packages
+            dnf install -y httpd php8.2 php8.2-mysqlnd php8.2-opcache php8.2-gd \
+                          php8.2-xml php8.2-mbstring php8.2-curl php8.2-zip \
+                          mariadb105 amazon-efs-utils amazon-cloudwatch-agent
+            
+            # Configure PHP for production
+            sed -i 's/memory_limit = .*/memory_limit = 256M/' /etc/php.ini
+            sed -i 's/upload_max_filesize = .*/upload_max_filesize = 64M/' /etc/php.ini
+            sed -i 's/post_max_size = .*/post_max_size = 64M/' /etc/php.ini
+            sed -i 's/max_execution_time = .*/max_execution_time = 300/' /etc/php.ini
+            sed -i 's/expose_php = .*/expose_php = Off/' /etc/php.ini
+            
+            # Configure OPcache for production
+            cat >> /etc/php.d/10-opcache.ini << EOF
+            opcache.memory_consumption=256
+            opcache.interned_strings_buffer=8
+            opcache.max_accelerated_files=4000
+            opcache.revalidate_freq=2
+            opcache.fast_shutdown=1
+            opcache.enable_cli=1
+            opcache.file_cache=/var/www/.opcache
+            EOF
+            
+            # Create opcache directory
+            mkdir -p /var/www/.opcache
+            chown apache:apache /var/www/.opcache
+            
+            # Mount EFS
+            mkdir -p /var/www/html/wp-content
+            echo "${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /var/www/html/wp-content efs defaults,_netdev,tls" >> /etc/fstab
+            mount -a
+            
+            # Install WP-CLI
+            curl -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+            chmod +x /usr/local/bin/wp
+            
+            # Download WordPress
+            cd /var/www/html
+            wp core download --allow-root
+            
+            # Wait for database
+            until mysql -h ${DatabaseCluster.Endpoint.Address} -u ${DatabaseMasterUsername} -p${DatabaseMasterPassword} -e "SELECT 1" > /dev/null 2>&1; do
+              echo "Waiting for database..."
+              sleep 10
+            done
+            
+            # Configure WordPress
+            if [ ! -f wp-config.php ]; then
+              wp config create --dbname=wordpress --dbuser=${DatabaseMasterUsername} \
+                --dbpass='${DatabaseMasterPassword}' --dbhost=${DatabaseCluster.Endpoint.Address} \
+                --allow-root
+              
+              # Generate security keys
+              wp config shuffle-salts --allow-root
+              
+              # Install WordPress
+              SITE_URL="https://${ApplicationLoadBalancer.DNSName}"
+              if [ -n "${WPDomainName}" ]; then
+                SITE_URL="https://${WPDomainName}"
+              fi
+              
+              wp core install --url="$SITE_URL" --title="${WPTitle}" \
+                --admin_user=${WPAdminUsername} --admin_password='${WPAdminPassword}' \
+                --admin_email=${AdminEmail} --allow-root
+              
+              # Install essential plugins
+              wp plugin install redis-cache --activate --allow-root
+              wp plugin install w3-total-cache --activate --allow-root
+              wp plugin install wordfence --activate --allow-root
+              wp plugin install wp-super-cache --activate --allow-root
+              
+              # Configure Redis
+              wp config set WP_REDIS_HOST ${CacheReplicationGroup.PrimaryEndPoint.Address} --allow-root
+              wp config set WP_REDIS_PORT 6379 --allow-root
+              wp config set WP_REDIS_DATABASE 0 --allow-root
+              
+              # Production WordPress configuration
+              cat >> wp-config.php << 'WPEOF'
+            
+            // Production WordPress Configuration
+            define('WP_ENVIRONMENT_TYPE', '${Environment}');
+            define('DISALLOW_FILE_EDIT', true);
+            define('DISALLOW_FILE_MODS', true);
+            define('AUTOMATIC_UPDATER_DISABLED', true);
+            define('WP_POST_REVISIONS', 3);
+            define('AUTOSAVE_INTERVAL', 300);
+            define('WP_CRON_LOCK_TIMEOUT', 120);
+            
+            // Load balancer configuration
+            if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+                $_SERVER['HTTPS'] = 'on';
+            }
+            
+            // Dynamic URL configuration
+            define('WP_HOME', 'https://' . $_SERVER['HTTP_HOST']);
+            define('WP_SITEURL', WP_HOME);
+            
+            // Security headers
+            header('X-Content-Type-Options: nosniff');
+            header('X-Frame-Options: SAMEORIGIN');
+            header('X-XSS-Protection: 1; mode=block');
+            WPEOF
+            fi
+            
+            # Create health check file
+            cat > /var/www/html/health-check.php << 'HEALTHEOF'
+            <?php
+            // Health check endpoint
+            $db_host = '${DatabaseCluster.Endpoint.Address}';
+            $db_user = '${DatabaseMasterUsername}';
+            $db_pass = '${DatabaseMasterPassword}';
+            $db_name = 'wordpress';
+            
+            try {
+                $pdo = new PDO("mysql:host=$db_host;dbname=$db_name", $db_user, $db_pass);
+                $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+                $stmt = $pdo->query('SELECT 1');
+                if ($stmt) {
+                    http_response_code(200);
+                    echo 'OK';
+                } else {
+                    http_response_code(500);
+                    echo 'Database connection failed';
+                }
+            } catch (Exception $e) {
+                http_response_code(500);
+                echo 'Health check failed: ' . $e->getMessage();
+            }
+            ?>
+            HEALTHEOF
+            
+            # Set permissions
+            chown -R apache:apache /var/www/html
+            find /var/www/html -type d -exec chmod 755 {} \;
+            find /var/www/html -type f -exec chmod 644 {} \;
+            
+            # Configure Apache
+            cat > /etc/httpd/conf.d/wordpress.conf << 'APACHEEOF'
+            <VirtualHost *:80>
+                DocumentRoot /var/www/html
+                ServerName ${ApplicationLoadBalancer.DNSName}
+                
+                <Directory /var/www/html>
+                    Options Indexes FollowSymLinks
+                    AllowOverride All
+                    Require all granted
+                </Directory>
+                
+                # Security headers
+                Header always set X-Content-Type-Options nosniff
+                Header always set X-Frame-Options SAMEORIGIN
+                Header always set X-XSS-Protection "1; mode=block"
+                Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+                
+                # Hide server information
+                ServerTokens Prod
+                ServerSignature Off
+                
+                ErrorLog /var/log/httpd/wordpress_error.log
+                CustomLog /var/log/httpd/wordpress_access.log combined
+            </VirtualHost>
+            APACHEEOF
+            
+            # Start services
+            systemctl enable httpd
+            systemctl start httpd
+            
+            # Configure CloudWatch agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
+            {
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/httpd/wordpress_access.log",
+                        "log_group_name": "/aws/ec2/wordpress/apache/access",
+                        "log_stream_name": "{instance_id}"
+                      },
+                      {
+                        "file_path": "/var/log/httpd/wordpress_error.log",
+                        "log_group_name": "/aws/ec2/wordpress/apache/error",
+                        "log_stream_name": "{instance_id}"
+                      }
+                    ]
+                  }
+                }
+              },
+              "metrics": {
+                "namespace": "WordPress/EC2",
+                "metrics_collected": {
+                  "cpu": {
+                    "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                    "metrics_collection_interval": 60
+                  },
+                  "disk": {
+                    "measurement": ["used_percent"],
+                    "metrics_collection_interval": 60,
+                    "resources": ["*"]
+                  },
+                  "mem": {
+                    "measurement": ["mem_used_percent"],
+                    "metrics_collection_interval": 60
+                  }
+                }
+              }
+            }
+            CWEOF
+            
+            systemctl enable amazon-cloudwatch-agent
+            systemctl start amazon-cloudwatch-agent
+            
+            # Signal completion
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+
+  # Production Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !If [IsProduction, 2, 1]
+      MaxSize: !If [IsProduction, 10, 4]
+      DesiredCapacity: !If [IsProduction, 3, 2]
+      VPCZoneIdentifier:
+        - !Ref WebSubnet1
+        - !Ref WebSubnet2
+        - !Ref WebSubnet3
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      DefaultCooldown: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-instance'
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !If [IsProduction, 3, 2]
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !If [IsProduction, 2, 1]
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+
+  # Auto Scaling Policies
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: 1
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: -1
+
+  # CloudWatch Alarms
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale up on high CPU
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+        - !Ref SNSAlarmTopic
+
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale down on low CPU
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU utilization
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref DatabaseCluster
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  # SNS Topic for Alarms
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alarms'
+      DisplayName: WordPress Production Alarms
+
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SNSAlarmTopic
+      Endpoint: !Ref AdminEmail
+
+  # CloudFront Distribution (Optional)
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: HasCloudFrontCert
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !If [HasDomainName, !Ref WPDomainName, !Ref "AWS::NoValue"]
+        Origins:
+          - Id: ALBOrigin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: !If [HasSSLCertificate, "https-only", "http-only"]
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          ForwardedValues:
+            QueryString: true
+            Headers: ["Host", "CloudFront-Forwarded-Proto", "CloudFront-Is-Desktop-Viewer", "CloudFront-Is-Mobile-Viewer", "CloudFront-Is-Tablet-Viewer"]
+            Cookies:
+              Forward: all
+          MinTTL: 0
+          DefaultTTL: 0
+          MaxTTL: 31536000
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: "*.css"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            ForwardedValues:
+              QueryString: false
+              Headers: ["Host"]
+            MinTTL: 86400
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+            Compress: true
+          - PathPattern: "*.js"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            ForwardedValues:
+              QueryString: false
+              Headers: ["Host"]
+            MinTTL: 86400
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+            Compress: true
+          - PathPattern: "*.jpg"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            ForwardedValues:
+              QueryString: false
+              Headers: ["Host"]
+            MinTTL: 86400
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+            Compress: true
+          - PathPattern: "*.png"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            ForwardedValues:
+              QueryString: false
+              Headers: ["Host"]
+            MinTTL: 86400
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+            Compress: true
+        Enabled: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          !If
+            - HasCloudFrontCert
+            - AcmCertificateArn: !Ref CloudFrontAcmCertificate
+              SslSupportMethod: sni-only
+              MinimumProtocolVersion: TLSv1.2_2021
+            - CloudFrontDefaultCertificate: true
+        WebACLId: !GetAtt CloudFrontWebACL.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cloudfront'
+
+  # CloudFront WAF (Global)
+  CloudFrontWebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: HasCloudFrontCert
+    Properties:
+      Name: !Sub '${AWS::StackName}-cloudfront-acl'
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CloudFrontCommonRuleSetMetric
+        - Name: AWSManagedRulesWordPressRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesWordPressRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CloudFrontWordPressRuleSetMetric
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${AWS::StackName}-cloudfront-acl'
+
+  # Route53 Record Set (Optional)
+  Route53RecordSet:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomainName
+    Properties:
+      HostedZoneName: !Sub '${WPDomainName}.'
+      Name: !Ref WPDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !If
+          - HasCloudFrontCert
+          - !GetAtt CloudFrontDistribution.DomainName
+          - !GetAtt ApplicationLoadBalancer.DNSName
+        HostedZoneId: !If
+          - HasCloudFrontCert
+          - Z2FDTNDATAQYW2
+          - !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+
+  # Bastion Host (Optional)
+  BastionLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-bastion-template'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: t3.nano
+        KeyName: !Ref EC2KeyName
+        SecurityGroupIds:
+          - !Ref BastionSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt WebInstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            dnf update -y
+            dnf install -y mysql
+
+  BastionAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BastionLaunchTemplate
+        Version: !GetAtt BastionLaunchTemplate.LatestVersionNumber
+      MinSize: 0
+      MaxSize: 1
+      DesiredCapacity: 0
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+        - !Ref PublicSubnet3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion'
+          PropagateAtLaunch: true
+
+Outputs:
+  WordPressSiteURL:
+    Description: WordPress Site URL
+    Value: !If
+      - HasDomainName
+      - !If
+        - HasCloudFrontCert
+        - !Sub 'https://${WPDomainName}'
+        - !If
+          - HasSSLCertificate
+          - !Sub 'https://${WPDomainName}'
+          - !Sub 'http://${WPDomainName}'
+      - !If
+        - HasCloudFrontCert
+        - !Sub 'https://${CloudFrontDistribution.DomainName}'
+        - !If
+          - HasSSLCertificate
+          - !Sub 'https://${ApplicationLoadBalancer.DNSName}'
+          - !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+  
+  DatabaseEndpoint:
+    Description: RDS Aurora Endpoint
+    Value: !GetAtt DatabaseCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+  
+  EFSFileSystemId:
+    Description: EFS File System ID
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-EFSFileSystemId'
+  
+  CloudFrontURL:
+    Condition: HasCloudFrontCert
+    Description: CloudFront Distribution URL
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontURL'
+  
+  BastionAutoScalingGroup:
+    Description: Bastion Auto Scaling Group (set desired capacity to 1 when needed)
+    Value: !Ref BastionAutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BastionASG'
+  
+  ALBDNSName:
+    Description: Application Load Balancer DNS Name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBDNSName'

@@ -56,9 +56,61 @@ Parameters:
     Type: String
     Default: ""
     Description: Optional ACM certificate ARN for HTTPS
+  
+  CloudFrontAcmCertificate:
+    Type: String
+    Default: ""
+    Description: Optional CloudFront ACM certificate ARN (us-east-1)
+  
+  WPDomainName:
+    Type: String
+    Default: ""
+    Description: Optional domain name for WordPress site
+  
+  UseCloudFront:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Create CloudFront distribution
+  
+  UseRoute53:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Create Route53 record set
+  
+  UseWAF:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create WAF Web ACL for protection
+  
+  WPTitle:
+    Type: String
+    Default: "WordPress on AWS"
+    Description: WordPress site title
+  
+  WPAdminUsername:
+    Type: String
+    Default: "admin"
+    MinLength: 4
+    MaxLength: 16
+    Description: WordPress admin username
+  
+  WPAdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 41
+    Description: WordPress admin password
 
 Conditions:
   HasSSLCertificate: !Not [!Equals [!Ref PublicAlbAcmCertificate, ""]]
+  HasCloudFrontCert: !Not [!Equals [!Ref CloudFrontAcmCertificate, ""]]
+  HasDomainName: !Not [!Equals [!Ref WPDomainName, ""]]
+  CreateCloudFront: !Equals [!Ref UseCloudFront, "true"]
+  CreateRoute53: !Equals [!Ref UseRoute53, "true"]
+  CreateWAF: !Equals [!Ref UseWAF, "true"]
 
 Resources:
   # VPC
@@ -109,26 +161,47 @@ Resources:
         - Key: Name
           Value: !Sub '${AWS::StackName}-public-2'
 
-  # Private Subnets
-  PrivateSubnet1:
+  # Web Subnets (Private)
+  WebSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: 10.0.10.0/24
+      CidrBlock: 10.0.0.0/22
       AvailabilityZone: !Select [0, !GetAZs '']
       Tags:
         - Key: Name
-          Value: !Sub '${AWS::StackName}-private-1'
+          Value: !Sub '${AWS::StackName}-web-1'
 
-  PrivateSubnet2:
+  WebSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: 10.0.11.0/24
+      CidrBlock: 10.0.4.0/22
       AvailabilityZone: !Select [1, !GetAZs '']
       Tags:
         - Key: Name
-          Value: !Sub '${AWS::StackName}-private-2'
+          Value: !Sub '${AWS::StackName}-web-2'
+
+  # Data Subnets (Private)
+  DataSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.100.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-1'
+
+  DataSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.101.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-2'
 
   # NAT Gateway
   NATGateway1EIP:
@@ -152,13 +225,21 @@ Resources:
         - Key: Name
           Value: !Sub '${AWS::StackName}-public-rt'
 
-  PrivateRouteTable:
+  WebRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
       Tags:
         - Key: Name
-          Value: !Sub '${AWS::StackName}-private-rt'
+          Value: !Sub '${AWS::StackName}-web-rt'
+
+  DataRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-rt'
 
   PublicRoute:
     Type: AWS::EC2::Route
@@ -168,10 +249,17 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
 
-  PrivateRoute:
+  WebRoute:
     Type: AWS::EC2::Route
     Properties:
-      RouteTableId: !Ref PrivateRouteTable
+      RouteTableId: !Ref WebRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway1
+
+  DataRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref DataRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NATGateway1
 
@@ -187,17 +275,29 @@ Resources:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
 
-  PrivateSubnetRouteTableAssociation1:
+  WebSubnetRouteTableAssociation1:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PrivateSubnet1
-      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref WebSubnet1
+      RouteTableId: !Ref WebRouteTable
 
-  PrivateSubnetRouteTableAssociation2:
+  WebSubnetRouteTableAssociation2:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PrivateSubnet2
-      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref WebSubnet2
+      RouteTableId: !Ref WebRouteTable
+
+  DataSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnet1
+      RouteTableId: !Ref DataRouteTable
+
+  DataSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnet2
+      RouteTableId: !Ref DataRouteTable
 
   # Security Groups
   ALBSecurityGroup:
@@ -360,8 +460,8 @@ Resources:
     Properties:
       DBSubnetGroupDescription: Subnet group for RDS
       SubnetIds:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
+        - !Ref DataSubnet1
+        - !Ref DataSubnet2
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-db-subnet-group'
@@ -404,8 +504,8 @@ Resources:
     Properties:
       Description: Subnet group for ElastiCache
       SubnetIds:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
+        - !Ref DataSubnet1
+        - !Ref DataSubnet2
 
   # ElastiCache Redis
   CacheCluster:
@@ -438,7 +538,7 @@ Resources:
     Type: AWS::EFS::MountTarget
     Properties:
       FileSystemId: !Ref EFSFileSystem
-      SubnetId: !Ref PrivateSubnet1
+      SubnetId: !Ref DataSubnet1
       SecurityGroups:
         - !Ref EFSSecurityGroup
 
@@ -446,7 +546,7 @@ Resources:
     Type: AWS::EFS::MountTarget
     Properties:
       FileSystemId: !Ref EFSFileSystem
-      SubnetId: !Ref PrivateSubnet2
+      SubnetId: !Ref DataSubnet2
       SecurityGroups:
         - !Ref EFSSecurityGroup
 
@@ -523,27 +623,64 @@ Resources:
             cp -r wordpress/* /var/www/html/
             rm -rf wordpress latest.tar.gz
             
+            # Install WP-CLI
+            curl -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+            chmod +x /usr/local/bin/wp
+            
             # Configure WordPress
             cd /var/www/html
-            cp wp-config-sample.php wp-config.php
-            sed -i "s/database_name_here/wordpress/" wp-config.php
-            sed -i "s/username_here/${DatabaseMasterUsername}/" wp-config.php
-            sed -i "s/password_here/${DatabaseMasterPassword}/" wp-config.php
-            sed -i "s/localhost/${DatabaseCluster.Endpoint.Address}/" wp-config.php
             
-            # Add Redis configuration
-            cat >> wp-config.php << 'EOF'
+            # Wait for database to be ready
+            until mysql -h ${DatabaseCluster.Endpoint.Address} -u ${DatabaseMasterUsername} -p${DatabaseMasterPassword} -e "SELECT 1" > /dev/null 2>&1; do
+              echo "Waiting for database..."
+              sleep 10
+            done
             
-            // Redis Cache Configuration
-            define('WP_REDIS_HOST', '${CacheCluster.RedisEndpoint.Address}');
-            define('WP_REDIS_PORT', 6379);
-            define('WP_REDIS_DATABASE', 0);
+            # Configure WordPress if not already done
+            if [ ! -f wp-config.php ]; then
+              wp config create --dbname=wordpress --dbuser=${DatabaseMasterUsername} \
+                --dbpass='${DatabaseMasterPassword}' --dbhost=${DatabaseCluster.Endpoint.Address} \
+                --allow-root
+              
+              # Install WordPress
+              SITE_URL="http://${ApplicationLoadBalancer.DNSName}"
+              wp core install --url="$SITE_URL" --title="${WPTitle}" \
+                --admin_user=${WPAdminUsername} --admin_password='${WPAdminPassword}' \
+                --admin_email=${AdminEmail} --allow-root
+              
+              # Install essential plugins
+              wp plugin install redis-cache --activate --allow-root
+              wp plugin install w3-total-cache --activate --allow-root
+              wp plugin install wordfence --activate --allow-root
+              
+              # Configure Redis
+              wp config set WP_REDIS_HOST ${CacheCluster.RedisEndpoint.Address} --allow-root
+              wp config set WP_REDIS_PORT 6379 --allow-root
+              wp config set WP_REDIS_DATABASE 0 --allow-root
+              
+              # Load balancer configuration
+              cat >> wp-config.php << 'WPEOF'
             
             // Load balancer configuration
             if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
                 $_SERVER['HTTPS'] = 'on';
             }
-            EOF
+            
+            // Define home and site URL dynamically
+            define('WP_HOME', 'http' . (isset($_SERVER['HTTPS']) ? 's' : '') . '://' . $_SERVER['HTTP_HOST']);
+            define('WP_SITEURL', WP_HOME);
+            
+            // Security keys (generate new ones for production)
+            define('AUTH_KEY',         'put your unique phrase here');
+            define('SECURE_AUTH_KEY',  'put your unique phrase here');
+            define('LOGGED_IN_KEY',    'put your unique phrase here');
+            define('NONCE_KEY',        'put your unique phrase here');
+            define('AUTH_SALT',        'put your unique phrase here');
+            define('SECURE_AUTH_SALT', 'put your unique phrase here');
+            define('LOGGED_IN_SALT',   'put your unique phrase here');
+            define('NONCE_SALT',       'put your unique phrase here');
+            WPEOF
+            fi
             
             # Set permissions
             chown -R apache:apache /var/www/html
@@ -552,6 +689,54 @@ Resources:
             # Start services
             systemctl enable httpd
             systemctl start httpd
+            
+            # Install CloudWatch agent
+            dnf install -y amazon-cloudwatch-agent
+            
+            # Configure CloudWatch agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
+            {
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/httpd/access_log",
+                        "log_group_name": "/aws/ec2/wordpress/apache/access",
+                        "log_stream_name": "{instance_id}"
+                      },
+                      {
+                        "file_path": "/var/log/httpd/error_log",
+                        "log_group_name": "/aws/ec2/wordpress/apache/error",
+                        "log_stream_name": "{instance_id}"
+                      }
+                    ]
+                  }
+                }
+              },
+              "metrics": {
+                "namespace": "WordPress/EC2",
+                "metrics_collected": {
+                  "cpu": {
+                    "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                    "metrics_collection_interval": 60
+                  },
+                  "disk": {
+                    "measurement": ["used_percent"],
+                    "metrics_collection_interval": 60,
+                    "resources": ["*"]
+                  },
+                  "mem": {
+                    "measurement": ["mem_used_percent"],
+                    "metrics_collection_interval": 60
+                  }
+                }
+              }
+            }
+            CWEOF
+            
+            systemctl enable amazon-cloudwatch-agent
+            systemctl start amazon-cloudwatch-agent
             
             # Signal completion
             /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
@@ -564,11 +749,11 @@ Resources:
         LaunchTemplateId: !Ref LaunchTemplate
         Version: !GetAtt LaunchTemplate.LatestVersionNumber
       MinSize: 1
-      MaxSize: 4
+      MaxSize: 6
       DesiredCapacity: 2
       VPCZoneIdentifier:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
+        - !Ref WebSubnet1
+        - !Ref WebSubnet2
       TargetGroupARNs:
         - !Ref TargetGroup
       HealthCheckType: ELB
@@ -581,14 +766,274 @@ Resources:
       ResourceSignal:
         Count: 2
         Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+
+  # Auto Scaling Policies
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: 1
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: -1
+
+  # CloudWatch Alarms for Auto Scaling
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale up on high CPU
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale down on low CPU
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+
+  # WAF Web ACL (Optional)
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: CreateWAF
+    Properties:
+      Name: !Sub '${AWS::StackName}-web-acl'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSetMetric
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputsRuleSetMetric
+        - Name: AWSManagedRulesWordPressRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesWordPressRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: WordPressRuleSetMetric
+        - Name: RateLimitRule
+          Priority: 4
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitMetric
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${AWS::StackName}-web-acl'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-acl'
+
+  # Associate WAF with ALB
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: CreateWAF
+    Properties:
+      ResourceArn: !Ref ApplicationLoadBalancer
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # CloudFront Distribution (Optional)
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: CreateCloudFront
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !If [HasDomainName, !Ref WPDomainName, !Ref "AWS::NoValue"]
+        Origins:
+          - Id: ALBOrigin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: !If [HasSSLCertificate, "https-only", "http-only"]
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          ForwardedValues:
+            QueryString: true
+            Headers: ["*"]
+            Cookies:
+              Forward: all
+          MinTTL: 0
+          DefaultTTL: 0
+          MaxTTL: 31536000
+        Enabled: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          !If
+            - HasCloudFrontCert
+            - AcmCertificateArn: !Ref CloudFrontAcmCertificate
+              SslSupportMethod: sni-only
+              MinimumProtocolVersion: TLSv1.2_2021
+            - CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cloudfront'
+
+  # Route53 Record Set (Optional)
+  Route53RecordSet:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateRoute53
+    Properties:
+      HostedZoneName: !Sub '${WPDomainName}.'
+      Name: !If [HasDomainName, !Sub 'www.${WPDomainName}', !Ref "AWS::NoValue"]
+      Type: A
+      AliasTarget:
+        DNSName: !If
+          - CreateCloudFront
+          - !GetAtt CloudFrontDistribution.DomainName
+          - !GetAtt ApplicationLoadBalancer.DNSName
+        HostedZoneId: !If
+          - CreateCloudFront
+          - Z2FDTNDATAQYW2  # CloudFront hosted zone ID
+          - !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+
+  # Bastion Host (Optional for management)
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bastion Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH from internet (restrict this in production)
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-sg'
+
+  BastionLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-bastion-template'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: t3.nano
+        KeyName: !Ref EC2KeyName
+        SecurityGroupIds:
+          - !Ref BastionSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt WebInstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            dnf update -y
+            dnf install -y mysql
+
+  BastionAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BastionLaunchTemplate
+        Version: !GetAtt BastionLaunchTemplate.LatestVersionNumber
+      MinSize: 0
+      MaxSize: 1
+      DesiredCapacity: 0  # Set to 1 when needed
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion'
+          PropagateAtLaunch: true
 
 Outputs:
   WordPressSiteURL:
     Description: WordPress Site URL
     Value: !If
-      - HasSSLCertificate
-      - !Sub 'https://${ApplicationLoadBalancer.DNSName}'
-      - !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+      - CreateRoute53
+      - !If
+        - HasDomainName
+        - !Sub 'https://www.${WPDomainName}'
+        - !Sub 'https://${ApplicationLoadBalancer.DNSName}'
+      - !If
+        - CreateCloudFront
+        - !Sub 'https://${CloudFrontDistribution.DomainName}'
+        - !If
+          - HasSSLCertificate
+          - !Sub 'https://${ApplicationLoadBalancer.DNSName}'
+          - !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+  
+  CloudFrontURL:
+    Condition: CreateCloudFront
+    Description: CloudFront Distribution URL
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+  
+  BastionAutoScalingGroup:
+    Description: Bastion Auto Scaling Group (set desired capacity to 1 when needed)
+    Value: !Ref BastionAutoScalingGroup
   
   DatabaseEndpoint:
     Description: Database Endpoint
