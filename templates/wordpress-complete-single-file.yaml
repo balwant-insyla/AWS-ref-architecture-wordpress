@@ -633,6 +633,14 @@ Resources:
             # Install PHP (try different approach)
             dnf install -y php php-mysqlnd php-gd php-xml php-mbstring php-curl php-zip || signal_failure "PHP installation failed"
             
+            # Configure PHP for production
+            sed -i 's/memory_limit = .*/memory_limit = 512M/' /etc/php.ini
+            sed -i 's/upload_max_filesize = .*/upload_max_filesize = 128M/' /etc/php.ini
+            sed -i 's/post_max_size = .*/post_max_size = 512M/' /etc/php.ini
+            sed -i 's/max_execution_time = .*/max_execution_time = 300/' /etc/php.ini
+            sed -i 's/max_input_time = .*/max_input_time = 600/' /etc/php.ini
+            sed -i 's/max_input_vars = .*/max_input_vars = 1000/' /etc/php.ini
+            
             # Start Apache early
             systemctl enable httpd
             systemctl start httpd || signal_failure "Apache start failed"
