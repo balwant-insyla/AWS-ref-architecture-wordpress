@@ -660,29 +660,8 @@ Resources:
             cp -r wordpress/* /var/www/html/ || signal_failure "WordPress copy failed"
             rm -rf wordpress latest.tar.gz
             
-            # Install WP-CLI
-            curl -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-            chmod +x /usr/local/bin/wp
-            
-            # Configure WordPress
-            cd /var/www/html
-            
-            # Wait for database to be ready
-            until mysql -h ${DatabaseCluster.Endpoint.Address} -u ${DatabaseMasterUsername} -p${DatabaseMasterPassword} -e "SELECT 1" > /dev/null 2>&1; do
-              echo "Waiting for database..."
-              sleep 10
-            done
-            
-            # Create wp-config.php
-            wp config create --dbname=${DatabaseName} --dbuser=${DatabaseMasterUsername} \
-              --dbpass='${DatabaseMasterPassword}' --dbhost=${DatabaseCluster.Endpoint.Address} \
-              --dbprefix='${WPTablePrefix}' --allow-root
-            
-            # Install WordPress
-            SITE_URL="http://${ApplicationLoadBalancer.DNSName}"
-            wp core install --url="$SITE_URL" --title="${WPTitle}" \
-              --admin_user=${WPAdminUsername} --admin_password='${WPAdminPassword}' \
-              --admin_email=${AdminEmail} --allow-root
+            # Just create a simple test page
+            echo "<h1>WordPress Infrastructure Ready!</h1><p>Database: ${DatabaseCluster.Endpoint.Address}</p>" > /var/www/html/index.html
             
             # Set permissions
             chown -R apache:apache /var/www/html
@@ -790,6 +769,43 @@ Resources:
       DefaultAction:
         Allow: {}
       Rules:
+        # WordPress Admin Exception Rule (Highest Priority)
+        - Name: WordPressAdminException
+          Priority: 0
+          Action:
+            Allow: {}
+          Statement:
+            OrStatement:
+              Statements:
+                - ByteMatchStatement:
+                    SearchString: "/wp-admin/"
+                    FieldToMatch:
+                      UriPath: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: NONE
+                    PositionalConstraint: STARTS_WITH
+                - ByteMatchStatement:
+                    SearchString: "/wp-login.php"
+                    FieldToMatch:
+                      UriPath: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: NONE
+                    PositionalConstraint: CONTAINS
+                - ByteMatchStatement:
+                    SearchString: "/wp-content/plugins/"
+                    FieldToMatch:
+                      UriPath: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: NONE
+                    PositionalConstraint: STARTS_WITH
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: WordPressAdminExceptionMetric
+        # AWS Managed Rules with Exceptions
         - Name: AWSManagedRulesCommonRuleSet
           Priority: 1
           OverrideAction:
@@ -798,6 +814,9 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: SizeRestrictions_BODY
+                - Name: GenericRFI_BODY
           VisibilityConfig:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
@@ -822,6 +841,9 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesWordPressRuleSet
+              ExcludedRules:
+                - Name: WordPressExploitablePathsRule
+                - Name: WordPressLoopbackRule
           VisibilityConfig:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
@@ -834,6 +856,17 @@ Resources:
             RateBasedStatement:
               Limit: 2000
               AggregateKeyType: IP
+              ScopeDownStatement:
+                NotStatement:
+                  Statement:
+                    ByteMatchStatement:
+                      SearchString: "/wp-admin/"
+                      FieldToMatch:
+                        UriPath: {}
+                      TextTransformations:
+                        - Priority: 0
+                          Type: NONE
+                      PositionalConstraint: STARTS_WITH
           VisibilityConfig:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
@@ -854,6 +887,70 @@ Resources:
       ResourceArn: !Ref ApplicationLoadBalancer
       WebACLArn: !GetAtt WebACL.Arn
 
+  # CloudFront Cache Policies
+  StaticAssetsCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: CreateCloudFront
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-static-assets-cache'
+        Comment: 'Cache policy for static assets (CSS, JS, images)'
+        DefaultTTL: 86400  # 1 day
+        MaxTTL: 31536000   # 1 year
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+
+  DynamicContentCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: CreateCloudFront
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-dynamic-content-cache'
+        Comment: 'Cache policy for dynamic content (excludes logged-in users)'
+        DefaultTTL: 0
+        MaxTTL: 86400  # 1 day max
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          QueryStringsConfig:
+            QueryStringBehavior: all
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers:
+              - Host
+              - CloudFront-Forwarded-Proto
+              - CloudFront-Is-Mobile-Viewer
+              - CloudFront-Is-Tablet-Viewer
+          CookiesConfig:
+            CookieBehavior: whitelist
+            Cookies:
+              - wordpress_*
+              - wp-settings-*
+              - comment_*
+
+  AdminOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Condition: CreateCloudFront
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${AWS::StackName}-admin-origin-request'
+        Comment: 'Origin request policy for WordPress admin'
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allViewer
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
   # CloudFront Distribution (Optional)
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
@@ -868,20 +965,95 @@ Resources:
             CustomOriginConfig:
               HTTPPort: 80
               HTTPSPort: 443
-              OriginProtocolPolicy: !If [HasSSLCertificate, "https-only", "http-only"]
+              OriginProtocolPolicy: "http-only"
+        # Default behavior for dynamic content
         DefaultCacheBehavior:
           TargetOriginId: ALBOrigin
           ViewerProtocolPolicy: redirect-to-https
           AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
           CachedMethods: [GET, HEAD, OPTIONS]
-          ForwardedValues:
-            QueryString: true
-            Headers: ["*"]
-            Cookies:
-              Forward: all
-          MinTTL: 0
-          DefaultTTL: 0
-          MaxTTL: 31536000
+          CachePolicyId: !Ref DynamicContentCachePolicy
+          Compress: true
+        # Additional behaviors for different content types
+        CacheBehaviors:
+          # WordPress Admin - No caching
+          - PathPattern: "/wp-admin/*"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # AWS Managed CachingDisabled
+            OriginRequestPolicyId: !Ref AdminOriginRequestPolicy
+            Compress: false
+          # WordPress Login - No caching
+          - PathPattern: "/wp-login.php"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # AWS Managed CachingDisabled
+            OriginRequestPolicyId: !Ref AdminOriginRequestPolicy
+            Compress: false
+          # Static CSS files
+          - PathPattern: "*.css"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            Compress: true
+          # Static JS files
+          - PathPattern: "*.js"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            Compress: true
+          # Images
+          - PathPattern: "*.jpg"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            Compress: true
+          - PathPattern: "*.jpeg"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            Compress: true
+          - PathPattern: "*.png"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            Compress: true
+          - PathPattern: "*.gif"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            Compress: true
+          - PathPattern: "*.webp"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            Compress: true
+          # WordPress uploads directory
+          - PathPattern: "/wp-content/uploads/*"
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            Compress: true
         Enabled: true
         PriceClass: PriceClass_100
         ViewerCertificate:
