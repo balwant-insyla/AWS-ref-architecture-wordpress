@@ -431,11 +431,12 @@ Resources:
       Port: 80
       Protocol: HTTP
       VpcId: !Ref VPC
-      HealthCheckPath: /
+      HealthCheckPath: /health.php
       HealthCheckProtocol: HTTP
       HealthCheckIntervalSeconds: 30
       HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 3
+      UnhealthyThresholdCount: 5
+      HealthCheckTimeoutSeconds: 10
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-tg'
@@ -648,9 +649,12 @@ Resources:
             # Create basic index page
             echo "<h1>WordPress Loading...</h1>" > /var/www/html/index.html
             
-            # Mount EFS (simplified)
+            # Enable Apache mod_rewrite and configure .htaccess
+            sed -i 's/AllowOverride None/AllowOverride All/' /etc/httpd/conf/httpd.conf
+            
+            # Mount EFS with optimized options
             mkdir -p /var/www/html/wp-content
-            echo "${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /var/www/html/wp-content efs defaults,_netdev" >> /etc/fstab
+            echo "${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /var/www/html/wp-content efs tls,rsize=1048576,wsize=1048576,hard,intr,timeo=600,_netdev" >> /etc/fstab
             mount -a || echo "EFS mount failed, continuing..."
             
             # Download WordPress
@@ -660,17 +664,149 @@ Resources:
             cp -r wordpress/* /var/www/html/ || signal_failure "WordPress copy failed"
             rm -rf wordpress latest.tar.gz
             
-            # Just create a simple test page
-            echo "<h1>WordPress Infrastructure Ready!</h1><p>Database: ${DatabaseCluster.Endpoint.Address}</p>" > /var/www/html/index.html
+            # WordPress Setup with Timeout
+            setup_wordpress() {
+                echo "Attempting WordPress database setup..."
+                
+                # Test database connection first
+                timeout 30 mysql -h ${DatabaseCluster.Endpoint.Address} -u ${DatabaseMasterUsername} -p'${DatabaseMasterPassword}' -e "SELECT 1" 2>/dev/null
+                if [ $? -ne 0 ]; then
+                    echo "Database connection failed, skipping auto-setup"
+                    return 1
+                fi
+                
+                # Create wp-config.php on EFS if it doesn't exist
+                if [ ! -f /var/www/html/wp-content/wp-config.php ]; then
+                    cat > /var/www/html/wp-content/wp-config.php << 'EOF'
+<?php
+define('DB_NAME', '${DatabaseName}');
+define('DB_USER', '${DatabaseMasterUsername}');
+define('DB_PASSWORD', '${DatabaseMasterPassword}');
+define('DB_HOST', '${DatabaseCluster.Endpoint.Address}');
+define('DB_CHARSET', 'utf8');
+define('DB_COLLATE', '');
+
+// WordPress URLs - will be updated after domain setup
+define('WP_HOME', 'https://' . $_SERVER['HTTP_HOST']);
+define('WP_SITEURL', 'https://' . $_SERVER['HTTP_HOST']);
+
+// Force HTTPS
+$_SERVER['HTTPS'] = 'on';
+$_SERVER['SERVER_PORT'] = 443;
+
+// File system
+define('FS_METHOD', 'direct');
+
+// Security keys - should be updated in production
+define('AUTH_KEY',         'put your unique phrase here');
+define('SECURE_AUTH_KEY',  'put your unique phrase here');
+define('LOGGED_IN_KEY',    'put your unique phrase here');
+define('NONCE_KEY',        'put your unique phrase here');
+define('AUTH_SALT',        'put your unique phrase here');
+define('SECURE_AUTH_SALT', 'put your unique phrase here');
+define('LOGGED_IN_SALT',   'put your unique phrase here');
+define('NONCE_SALT',       'put your unique phrase here');
+
+$table_prefix = '${WPTablePrefix}';
+define('WP_DEBUG', false);
+
+if ( !defined('ABSPATH') )
+    define('ABSPATH', dirname(__FILE__) . '/../');
+
+require_once(ABSPATH . 'wp-settings.php');
+?>
+EOF
+                    chown apache:apache /var/www/html/wp-content/wp-config.php
+                    chmod 644 /var/www/html/wp-content/wp-config.php
+                    
+                    # Create symlink to wp-config.php on EFS
+                    ln -sf /var/www/html/wp-content/wp-config.php /var/www/html/wp-config.php
+                    
+                    echo "WordPress configuration created successfully"
+                    return 0
+                else
+                    # Config exists, create symlink
+                    ln -sf /var/www/html/wp-content/wp-config.php /var/www/html/wp-config.php
+                    echo "Using existing WordPress configuration"
+                    return 0
+                fi
+            }
+            
+            # Run WordPress setup with 5-minute timeout
+            echo "Starting WordPress setup with 5-minute timeout..."
+            timeout 300 bash -c 'setup_wordpress' || {
+                echo "WordPress auto-setup timed out or failed. Creating fallback setup page."
+                
+                # Create a setup instruction page
+                cat > /var/www/html/index.html << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WordPress Setup Required</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+        .container { background: #f9f9f9; padding: 30px; border-radius: 8px; }
+        .success { color: #28a745; }
+        .info { color: #17a2b8; }
+        .warning { color: #ffc107; }
+        code { background: #e9ecef; padding: 2px 4px; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 WordPress Infrastructure Ready!</h1>
+        <p class="success">✅ Your AWS infrastructure is successfully deployed and running!</p>
+        
+        <h2>📋 Setup Options:</h2>
+        
+        <h3 class="info">Option 1: Browser Setup (Recommended)</h3>
+        <p>Complete WordPress installation through your browser:</p>
+        <ol>
+            <li>Visit: <a href="/wp-admin/setup-config.php">/wp-admin/setup-config.php</a></li>
+            <li>Use these database details:</li>
+            <ul>
+                <li><strong>Database Name:</strong> <code>${DatabaseName}</code></li>
+                <li><strong>Username:</strong> <code>${DatabaseMasterUsername}</code></li>
+                <li><strong>Password:</strong> <code>${DatabaseMasterPassword}</code></li>
+                <li><strong>Database Host:</strong> <code>${DatabaseCluster.Endpoint.Address}</code></li>
+                <li><strong>Table Prefix:</strong> <code>${WPTablePrefix}</code></li>
+            </ul>
+        </ol>
+        
+        <h3 class="info">Option 2: Manual Configuration</h3>
+        <p>SSH to your instance and create wp-config.php manually if needed.</p>
+        
+        <h2>🏗️ Infrastructure Details:</h2>
+        <ul>
+            <li><strong>Database:</strong> ${DatabaseCluster.Endpoint.Address}</li>
+            <li><strong>EFS:</strong> Mounted at /var/www/html/wp-content</li>
+            <li><strong>Health Check:</strong> <a href="/health.php">/health.php</a></li>
+        </ul>
+        
+        <p class="warning">⚠️ Remove this page after WordPress setup is complete.</p>
+    </div>
+</body>
+</html>
+EOF
+                chown apache:apache /var/www/html/index.html
+            }
             
             # Set permissions
             chown -R apache:apache /var/www/html
             chmod -R 755 /var/www/html
+            chmod -R 775 /var/www/html/wp-content/uploads
+            chmod -R 775 /var/www/html/wp-content/plugins
+            
+            # Fix PHP-FPM socket permissions after restart
+            systemctl restart php-fpm
+            sleep 2
+            chown apache:apache /run/php-fpm/www.sock
+            chmod 660 /run/php-fpm/www.sock
             
             # Restart Apache
             systemctl restart httpd || signal_failure "Apache restart failed"
             
-            echo "WordPress installation completed successfully!"
+            echo "WordPress infrastructure setup completed successfully!"
             
             # Signal success
             /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
@@ -691,7 +827,7 @@ Resources:
       TargetGroupARNs:
         - !Ref TargetGroup
       HealthCheckType: ELB
-      HealthCheckGracePeriod: 300
+      HealthCheckGracePeriod: 600
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-web-instance'
@@ -749,9 +885,9 @@ Resources:
       MetricName: CPUUtilization
       Namespace: AWS/EC2
       Statistic: Average
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: 25
+      Period: 900
+      EvaluationPeriods: 4
+      Threshold: 15
       ComparisonOperator: LessThanThreshold
       Dimensions:
         - Name: AutoScalingGroupName
