@@ -1,0 +1,506 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Distributed Load Testing Solution
+  Deploys a complete load testing infrastructure that can simulate traffic
+  from multiple AWS regions to test your WordPress site performance.
+  This is completely isolated and only sends HTTP requests to your target.
+
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: Email address for admin notifications and login credentials
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Must be a valid email address
+
+  AdminName:
+    Type: String
+    Default: admin
+    Description: Admin username for the load testing console
+    MinLength: 4
+    MaxLength: 20
+
+  TestRegions:
+    Type: CommaDelimitedList
+    Default: "us-east-1,us-west-2,eu-west-1"
+    Description: AWS regions to launch test engines from (comma-separated)
+
+  SourceCodeBucket:
+    Type: String
+    Default: solutions-reference
+    Description: S3 bucket containing the solution source code
+
+  SourceCodePrefix:
+    Type: String
+    Default: distributed-load-testing-on-aws/v3.2.0
+    Description: S3 key prefix for the solution source code
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Administrator Configuration"
+        Parameters:
+          - AdminEmail
+          - AdminName
+      - Label:
+          default: "Load Testing Configuration"
+        Parameters:
+          - TestRegions
+      - Label:
+          default: "Solution Configuration"
+        Parameters:
+          - SourceCodeBucket
+          - SourceCodePrefix
+
+Resources:
+  # S3 Bucket for storing test results and configurations
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-load-test-results-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # DynamoDB table for storing test configurations and results
+  TestConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-test-configs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: testId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: testId
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # DynamoDB table for storing test results
+  TestResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-test-results"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: testId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: testId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LoadTestingPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TestConfigTable.Arn
+                  - !GetAtt TestResultsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "${ResultsBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Ref ResultsBucket
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeRegions
+                  - ec2:DescribeInstances
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:CreateTags
+                  - iam:PassRole
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # IAM Role for EC2 test engines
+  TestEngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TestEnginePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "${ResultsBucket}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt TestResultsTable.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  TestEngineInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref TestEngineRole
+
+  # Lambda function for managing load tests
+  LoadTestManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-load-test-manager"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          CONFIG_TABLE: !Ref TestConfigTable
+          RESULTS_TABLE: !Ref TestResultsTable
+          RESULTS_BUCKET: !Ref ResultsBucket
+          TEST_REGIONS: !Join [",", !Ref TestRegions]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Main handler for load test management
+              """
+              try:
+                  action = event.get('action', 'list')
+                  
+                  if action == 'create':
+                      return create_test(event)
+                  elif action == 'start':
+                      return start_test(event)
+                  elif action == 'stop':
+                      return stop_test(event)
+                  elif action == 'status':
+                      return get_test_status(event)
+                  elif action == 'results':
+                      return get_test_results(event)
+                  else:
+                      return list_tests()
+                      
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def create_test(event):
+              """Create a new load test configuration"""
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              test_id = str(uuid.uuid4())
+              config = {
+                  'testId': test_id,
+                  'name': event.get('name', 'Load Test'),
+                  'target_url': event.get('target_url'),
+                  'concurrent_users': event.get('concurrent_users', 100),
+                  'duration': event.get('duration', 300),
+                  'ramp_up': event.get('ramp_up', 60),
+                  'regions': event.get('regions', os.environ['TEST_REGIONS'].split(',')),
+                  'created_at': datetime.utcnow().isoformat(),
+                  'status': 'created'
+              }
+              
+              table.put_item(Item=config)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'testId': test_id,
+                      'message': 'Test configuration created successfully'
+                  })
+              }
+          
+          def start_test(event):
+              """Start a load test"""
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId is required'})
+                  }
+              
+              # Update test status to running
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, started_at = :started_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'running',
+                      ':started_at': datetime.utcnow().isoformat()
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Test started successfully'})
+              }
+          
+          def stop_test(event):
+              """Stop a running load test"""
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId is required'})
+                  }
+              
+              # Update test status to stopped
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, stopped_at = :stopped_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'stopped',
+                      ':stopped_at': datetime.utcnow().isoformat()
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Test stopped successfully'})
+              }
+          
+          def get_test_status(event):
+              """Get status of a load test"""
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId is required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              response = table.get_item(Key={'testId': test_id})
+              
+              if 'Item' not in response:
+                  return {
+                      'statusCode': 404,
+                      'body': json.dumps({'error': 'Test not found'})
+                  }
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Item'], default=str)
+              }
+          
+          def get_test_results(event):
+              """Get results of a load test"""
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId is required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['RESULTS_TABLE'])
+              
+              response = table.query(
+                  KeyConditionExpression='testId = :testId',
+                  ExpressionAttributeValues={':testId': test_id}
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Items'], default=str)
+              }
+          
+          def list_tests():
+              """List all load tests"""
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              response = table.scan()
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Items'], default=str)
+              }
+
+  # API Gateway for the web console
+  LoadTestingAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-load-testing-api"
+      Description: API for distributed load testing console
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Lambda Integration
+  APILambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LoadTestManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "${LoadTestingAPI}/*/POST/*"
+
+  # CloudWatch Dashboard for monitoring
+  LoadTestingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-load-testing"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${LoadTestManagerFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Load Testing Manager Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${LoadTestManagerFunction}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Load Testing Logs"
+              }
+            }
+          ]
+        }
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-notifications"
+      Subscription:
+        - Endpoint: !Ref AdminEmail
+          Protocol: email
+
+Outputs:
+  LoadTestingAPIEndpoint:
+    Description: API Gateway endpoint for load testing console
+    Value: !Sub "https://${LoadTestingAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Export:
+      Name: !Sub "${AWS::StackName}-api-endpoint"
+
+  ResultsBucketName:
+    Description: S3 bucket for storing test results
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-results-bucket"
+
+  ConfigTableName:
+    Description: DynamoDB table for test configurations
+    Value: !Ref TestConfigTable
+    Export:
+      Name: !Sub "${AWS::StackName}-config-table"
+
+  ResultsTableName:
+    Description: DynamoDB table for test results
+    Value: !Ref TestResultsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-results-table"
+
+  DashboardURL:
+    Description: CloudWatch dashboard for monitoring load tests
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-load-testing"
+
+  TestRegions:
+    Description: AWS regions configured for load testing
+    Value: !Join [", ", !Ref TestRegions]
+
+  AdminInstructions:
+    Description: Instructions for using the load testing solution
+    Value: !Sub |
+      1. Deploy this stack and wait for completion
+      2. Check your email (${AdminEmail}) for login credentials
+      3. Access the API endpoint to manage load tests
+      4. Configure test targeting: https://atl.direct
+      5. Monitor results in CloudWatch dashboard
+      6. Test engines will be launched in: ${TestRegions}
