@@ -458,9 +458,14 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub "${AWS::StackName}-notifications"
-      Subscriptions:
-        - Endpoint: !Ref AdminEmail
-          Protocol: email
+
+  # SNS Subscription for admin email
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
 
 Outputs:
   LoadTestingAPIEndpoint:

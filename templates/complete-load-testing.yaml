@@ -1,0 +1,599 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Complete Distributed Load Testing Solution
+
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: Email for notifications
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+  
+  TargetURL:
+    Type: String
+    Default: https://atl.direct
+    Description: URL to load test
+
+Resources:
+  # VPC for test engines
+  TestVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  TestSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TestVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  TestIGW:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref TestVPC
+      InternetGatewayId: !Ref TestIGW
+
+  TestRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TestVPC
+
+  TestRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref TestRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref TestIGW
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TestSubnet
+      RouteTableId: !Ref TestRouteTable
+
+  # Security Group
+  TestEngineSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for load test engines
+      VpcId: !Ref TestVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # S3 Bucket
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB Tables
+  TestConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: testId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: testId
+          KeyType: HASH
+
+  TestResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: testId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: testId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+  # IAM Roles
+  TestEngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TestEnginePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${ResultsBucket}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: 
+                  - !GetAtt TestConfigTable.Arn
+                  - !GetAtt TestResultsTable.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  TestEngineInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref TestEngineRole
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LoadTestPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                Resource: 
+                  - !GetAtt TestConfigTable.Arn
+                  - !GetAtt TestResultsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: 
+                  - !GetAtt ResultsBucket.Arn
+                  - !Sub "${ResultsBucket}/*"
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt TestEngineRole.Arn
+
+  # Launch Template for Test Engines
+  TestEngineLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-test-engine"
+      LaunchTemplateData:
+        ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2
+        InstanceType: t3.medium
+        IamInstanceProfile:
+          Arn: !GetAtt TestEngineInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref TestEngineSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd-tools python3 pip
+            pip3 install boto3 requests
+            
+            # Create load test script
+            cat > /home/ec2-user/load_test.py << 'EOF'
+            #!/usr/bin/env python3
+            import boto3
+            import requests
+            import time
+            import json
+            import threading
+            import subprocess
+            from datetime import datetime
+            
+            def run_apache_bench(url, concurrent, requests_total, duration):
+                """Run Apache Bench load test"""
+                cmd = [
+                    'ab',
+                    '-c', str(concurrent),
+                    '-n', str(requests_total),
+                    '-t', str(duration),
+                    '-g', '/tmp/ab_results.tsv',
+                    url
+                ]
+                
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration+60)
+                    return {
+                        'stdout': result.stdout,
+                        'stderr': result.stderr,
+                        'returncode': result.returncode
+                    }
+                except Exception as e:
+                    return {'error': str(e)}
+            
+            def upload_results(test_id, results):
+                """Upload results to S3 and DynamoDB"""
+                s3 = boto3.client('s3')
+                dynamodb = boto3.resource('dynamodb')
+                
+                # Upload to S3
+                bucket = '${ResultsBucket}'
+                key = f'results/{test_id}/{datetime.now().isoformat()}.json'
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=json.dumps(results),
+                    ContentType='application/json'
+                )
+                
+                # Store in DynamoDB
+                table = dynamodb.Table('${TestResultsTable}')
+                table.put_item(
+                    Item={
+                        'testId': test_id,
+                        'timestamp': datetime.now().isoformat(),
+                        'results': json.dumps(results),
+                        'region': boto3.Session().region_name
+                    }
+                )
+            
+            def main():
+                """Main load test execution"""
+                # Get test configuration from DynamoDB
+                dynamodb = boto3.resource('dynamodb')
+                table = dynamodb.Table('${TestConfigTable}')
+                
+                # Wait for test configuration
+                while True:
+                    try:
+                        response = table.scan(
+                            FilterExpression='#status = :status',
+                            ExpressionAttributeNames={'#status': 'status'},
+                            ExpressionAttributeValues={':status': 'running'}
+                        )
+                        
+                        if response['Items']:
+                            config = response['Items'][0]
+                            break
+                    except:
+                        pass
+                    
+                    time.sleep(10)
+                
+                # Run load test
+                results = run_apache_bench(
+                    config['target_url'],
+                    config['concurrent_users'],
+                    config['concurrent_users'] * 100,  # Total requests
+                    config['duration']
+                )
+                
+                # Upload results
+                upload_results(config['testId'], results)
+                
+                # Shutdown instance after test
+                subprocess.run(['sudo', 'shutdown', '-h', '+5'])
+            
+            if __name__ == '__main__':
+                main()
+            EOF
+            
+            chmod +x /home/ec2-user/load_test.py
+            
+            # Start load test in background
+            nohup python3 /home/ec2-user/load_test.py > /var/log/load_test.log 2>&1 &
+
+  # Lambda Functions
+  LoadTestManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          CONFIG_TABLE: !Ref TestConfigTable
+          RESULTS_TABLE: !Ref TestResultsTable
+          RESULTS_BUCKET: !Ref ResultsBucket
+          LAUNCH_TEMPLATE_ID: !Ref TestEngineLaunchTemplate
+          SUBNET_ID: !Ref TestSubnet
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          def handler(event, context):
+              action = event.get('action', 'help')
+              
+              if action == 'create':
+                  return create_test(event)
+              elif action == 'start':
+                  return start_test(event)
+              elif action == 'stop':
+                  return stop_test(event)
+              elif action == 'status':
+                  return get_status(event)
+              elif action == 'results':
+                  return get_results(event)
+              else:
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Load Test Manager',
+                          'actions': ['create', 'start', 'stop', 'status', 'results'],
+                          'usage': {
+                              'create': {'target_url': 'https://example.com', 'concurrent_users': 100, 'duration': 300},
+                              'start': {'testId': 'test-id'},
+                              'stop': {'testId': 'test-id'},
+                              'status': {'testId': 'test-id'},
+                              'results': {'testId': 'test-id'}
+                          }
+                      })
+                  }
+          
+          def create_test(event):
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              test_id = str(uuid.uuid4())
+              config = {
+                  'testId': test_id,
+                  'target_url': event.get('target_url', 'https://atl.direct'),
+                  'concurrent_users': int(event.get('concurrent_users', 100)),
+                  'duration': int(event.get('duration', 300)),
+                  'created_at': datetime.now().isoformat(),
+                  'status': 'created'
+              }
+              
+              table.put_item(Item=config)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'testId': test_id,
+                      'message': 'Test created successfully'
+                  })
+              }
+          
+          def start_test(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'testId required'})}
+              
+              # Update test status
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, started_at = :started_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'running',
+                      ':started_at': datetime.now().isoformat()
+                  }
+              )
+              
+              # Launch test engines
+              ec2 = boto3.client('ec2')
+              
+              # Launch 3 instances for distributed testing
+              response = ec2.run_instances(
+                  LaunchTemplate={
+                      'LaunchTemplateId': os.environ['LAUNCH_TEMPLATE_ID']
+                  },
+                  MinCount=3,
+                  MaxCount=3,
+                  SubnetId=os.environ['SUBNET_ID'],
+                  TagSpecifications=[
+                      {
+                          'ResourceType': 'instance',
+                          'Tags': [
+                              {'Key': 'Name', 'Value': f'LoadTest-{test_id}'},
+                              {'Key': 'TestId', 'Value': test_id}
+                          ]
+                      }
+                  ]
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Test started',
+                      'instances': [i['InstanceId'] for i in response['Instances']]
+                  })
+              }
+          
+          def stop_test(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'testId required'})}
+              
+              # Update status
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, stopped_at = :stopped_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'stopped',
+                      ':stopped_at': datetime.now().isoformat()
+                  }
+              )
+              
+              # Terminate instances
+              ec2 = boto3.client('ec2')
+              instances = ec2.describe_instances(
+                  Filters=[
+                      {'Name': 'tag:TestId', 'Values': [test_id]},
+                      {'Name': 'instance-state-name', 'Values': ['running', 'pending']}
+                  ]
+              )
+              
+              instance_ids = []
+              for reservation in instances['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_ids.append(instance['InstanceId'])
+              
+              if instance_ids:
+                  ec2.terminate_instances(InstanceIds=instance_ids)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Test stopped'})
+              }
+          
+          def get_status(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'testId required'})}
+              
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              response = table.get_item(Key={'testId': test_id})
+              
+              if 'Item' not in response:
+                  return {'statusCode': 404, 'body': json.dumps({'error': 'Test not found'})}
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Item'], default=str)
+              }
+          
+          def get_results(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'testId required'})}
+              
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['RESULTS_TABLE'])
+              
+              response = table.query(
+                  KeyConditionExpression='testId = :testId',
+                  ExpressionAttributeValues={':testId': test_id}
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Items'], default=str)
+              }
+
+  # API Gateway
+  LoadTestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      Description: Load Testing API
+
+  APIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref LoadTestAPI
+      ParentId: !GetAtt LoadTestAPI.RootResourceId
+      PathPart: test
+
+  APIMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref LoadTestAPI
+      ResourceId: !Ref APIResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LoadTestManagerFunction.Arn}/invocations"
+
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: APIMethod
+    Properties:
+      RestApiId: !Ref LoadTestAPI
+      StageName: prod
+
+  APILambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LoadTestManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LoadTestAPI}/*/*"
+
+  # SNS for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+Outputs:
+  APIEndpoint:
+    Description: API Gateway endpoint for load testing
+    Value: !Sub "https://${LoadTestAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/test"
+    
+  BucketName:
+    Description: S3 bucket for results
+    Value: !Ref ResultsBucket
+    
+  ConfigTable:
+    Description: DynamoDB config table
+    Value: !Ref TestConfigTable
+    
+  ResultsTable:
+    Description: DynamoDB results table
+    Value: !Ref TestResultsTable
+    
+  Instructions:
+    Description: How to use the load testing solution
+    Value: !Sub |
+      1. Create test: POST to API with {"action":"create","target_url":"https://atl.direct","concurrent_users":100,"duration":300}
+      2. Start test: POST with {"action":"start","testId":"your-test-id"}
+      3. Check status: POST with {"action":"status","testId":"your-test-id"}
+      4. Get results: POST with {"action":"results","testId":"your-test-id"}
+      5. Stop test: POST with {"action":"stop","testId":"your-test-id"}
