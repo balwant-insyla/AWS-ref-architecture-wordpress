@@ -57,7 +57,7 @@ Resources:
   ResultsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "${AWS::StackName}-load-test-results-${AWS::AccountId}"
+      BucketName: !Sub "load-test-results-${AWS::AccountId}-${AWS::Region}"
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
