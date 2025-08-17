@@ -140,12 +140,12 @@ Resources:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource:
-                  - !Sub "${ResultsBucket}/*"
+                  - !Sub "${ResultsBucket.Arn}/*"
               - Effect: Allow
                 Action:
                   - s3:ListBucket
                 Resource:
-                  - !Ref ResultsBucket
+                  - !GetAtt ResultsBucket.Arn
               - Effect: Allow
                 Action:
                   - ec2:DescribeRegions
@@ -183,7 +183,7 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                 Resource:
-                  - !Sub "${ResultsBucket}/*"
+                  - !Sub "${ResultsBucket.Arn}/*"
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
@@ -410,7 +410,7 @@ Resources:
       FunctionName: !Ref LoadTestManagerFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub "${LoadTestingAPI}/*/POST/*"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LoadTestingAPI}/*/*"
 
   # CloudWatch Dashboard for monitoring
   LoadTestingDashboard:
@@ -458,7 +458,7 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub "${AWS::StackName}-notifications"
-      Subscription:
+      Subscriptions:
         - Endpoint: !Ref AdminEmail
           Protocol: email
 
