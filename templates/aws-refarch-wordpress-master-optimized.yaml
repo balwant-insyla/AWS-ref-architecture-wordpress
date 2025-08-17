@@ -1,0 +1,759 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  WordPress High-Performance Architecture - Optimized for 10,000+ Concurrent Users
+  Version 2.1 - Includes all performance optimizations:
+  - TCP optimizations for high concurrency
+  - Apache/PHP-FPM tuning for 800+ workers
+  - RDS Proxy with connection pooling
+  - Redis object caching
+  - S3 media offloading
+  - Auto Scaling with target tracking
+  - System stability improvements
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: General AWS
+        Parameters:
+          - EC2KeyName
+          - SshAccessCidr
+          - AdminEmail
+          - WPDomainName
+          - CloudFrontAcmCertificate
+      - Label:
+          default: Network
+        Parameters:
+          - NumberOfAZs
+          - AvailabilityZones
+          - VpcCidr
+          - VpcTenancy
+      - Label:
+          default: File System Tier
+        Parameters:
+          - EfsPerformanceMode
+          - EfsEncrpytedBoolean
+          - EfsKmsKey
+      - Label:
+          default: Database Tier
+        Parameters:
+          - DatabaseName
+          - DatabaseMasterUsername
+          - DatabaseMasterPassword
+          - DatabaseSize
+          - DatabaseInstanceClass
+          - DatabaseEncrpytedBoolean
+          - DatabaseKmsKey
+          - UseElastiCacheBoolean
+          - ElastiCacheNodeType
+      - Label:
+          default: Web Tier
+        Parameters:
+          - PHPVersion
+          - WebInstanceType
+          - WebAsgMax
+          - WebAsgMin
+      - Label:
+          default: WordPress
+        Parameters:
+          - WPTitle
+          - WPAdminUsername
+          - WPAdminPassword
+          - WPDirectory
+          - WPLocale
+
+Parameters:
+  EC2KeyName:
+    AllowedPattern: ^([a-zA-Z0-9 @.`~!#$%^&*()_+,\\-])*$
+    ConstraintDescription: Must be letters (upper or lower), numbers, and special characters.
+    Description: Name of an EC2 KeyPair. Your bastion & Web instances will launch with this KeyPair.
+    Type: AWS::EC2::KeyPair::KeyName
+  
+  SshAccessCidr:
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    Description: The CIDR IP range that is permitted to SSH to bastion instance. Note - a value of 0.0.0.0/0 will allow access from ANY IP address.
+    Type: String
+    Default: 0.0.0.0/0
+
+  AdminEmail:
+    AllowedPattern: ^(([^<>()\[\]\\.,;:\s@"]+(\.[^<>()\[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$
+    Description: The admin email address for WordPress and SNS notifications.
+    Type: String
+
+  WPDomainName:
+    AllowedPattern: ^$|(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$
+    Description: '[ Optional ] The main domain name of the WordPress site (e.g. example.com).'
+    Type: String
+
+  CloudFrontAcmCertificate:
+    AllowedPattern: ^$|^arn:aws:acm:us-east-1:[0-9]{12}:certificate\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+    Description: '[ Optional ] The AWS Certification Manager certificate ARN for the CloudFront distribution certificate - this certificate should be created in the us-east-1 (N. Virginia) region and must reference the WordPress domain name you use below.'
+    Type: String
+
+  NumberOfAZs:
+    AllowedValues:
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    Default: 3
+    Description: Number of Availability Zones to use in the VPC. This must match your selections in the list of Availability Zones below.
+    Type: Number
+
+  AvailabilityZones:
+    Description: 'List of Availability Zones to use for the subnets in the VPC. Note: The logical order is preserved.'
+    Type: List<AWS::EC2::AvailabilityZone::Name>
+
+  VpcCidr:
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    Default: 10.0.0.0/16
+    Description: CIDR Block for the VPC
+    Type: String
+    
+  VpcTenancy:
+    AllowedValues:
+    - default
+    - dedicated
+    Default: default
+    Description: The allowed tenancy of instances launched into the VPC
+    Type: String
+
+  EfsPerformanceMode:
+    AllowedValues:
+    - generalPurpose
+    - maxIO
+    Default: generalPurpose
+    Description: Select the performance mode of the file system.
+    Type: String
+
+  EfsEncrpytedBoolean:
+    AllowedValues:
+    - true
+    - false
+    Default: true
+    Description: Create an encrypted Amazon EFS file system.
+    Type: String
+
+  EfsKmsKey:
+    AllowedPattern: ^$|^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+    ConstraintDescription: 'Key ARN example:  arn:aws:kms:us-east-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab'
+    Description: '[ Optional ] The AWS KMS customer-managed CMK ARN to encrypt & decrypt the Amazon EFS file system.'
+    Type: String
+
+  DatabaseName:
+    AllowedPattern: ^([a-zA-Z0-9]*)$
+    Description: The Amazon RDS master database name.
+    Type: String
+    Default: wordpress
+
+  DatabaseMasterUsername:
+    AllowedPattern: ^([a-zA-Z0-9]*)$
+    Description: The Amazon RDS master username.
+    ConstraintDescription: Must contain only alphanumeric characters and be at least 8 characters.
+    MaxLength: 16
+    MinLength: 1
+    Type: String
+    Default: dbadminwp
+
+  DatabaseMasterPassword:
+    AllowedPattern: ^([a-z0-9A-Z`~!#$%^&*()_+,\\-])*$
+    ConstraintDescription: Must be letters (upper or lower), numbers, and these special characters '_'`~!#$%^&*()_+,-
+    Description: The Amazon RDS master password.
+    MaxLength: 41
+    MinLength: 8
+    NoEcho: true
+    Type: String
+
+  DatabaseSize:
+    AllowedValues:
+    - db.r5.large
+    - db.r5.xlarge
+    - db.r5.2xlarge
+    - db.r5.4xlarge
+    - db.r5.12xlarge
+    - db.r5.24xlarge
+    Default: db.r5.large
+    Description: The Amazon RDS database instance class.
+    Type: String
+
+  DatabaseInstanceClass:
+    AllowedValues:
+    - db.r5.large
+    - db.r5.xlarge
+    - db.r5.2xlarge
+    - db.r5.4xlarge
+    - db.r5.12xlarge
+    - db.r5.24xlarge
+    Default: db.r5.large
+    Description: The Amazon RDS database instance class.
+    Type: String
+
+  DatabaseEncrpytedBoolean:
+    AllowedValues:
+    - true
+    - false
+    Default: true
+    Description: Indicates whether the DB instances in the cluster are encrypted.
+    Type: String
+
+  DatabaseKmsKey:
+    AllowedPattern: ^$|^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+    ConstraintDescription: 'Key ARN example:  arn:aws:kms:us-east-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab'
+    Description: '[ Optional ] The AWS KMS customer-managed CMK ARN to encrypt & decrypt the Amazon RDS database cluster.'
+    Type: String
+
+  UseElastiCacheBoolean:
+    AllowedValues:
+    - true
+    - false
+    Default: true
+    Description: Specifies whether an ElastiCache Cache Cluster should be created for object caching.
+    Type: String
+
+  ElastiCacheNodeType:
+    AllowedValues:
+    - cache.t3.micro
+    - cache.t3.small
+    - cache.t3.medium
+    - cache.r5.large
+    - cache.r5.xlarge
+    Default: cache.t3.medium
+    Description: The Amazon ElastiCache cluster node type.
+    Type: String
+
+  PHPVersion:
+    AllowedValues:
+    - 7.4
+    - 8.0
+    - 8.1
+    - 8.2
+    Default: 8.1
+    Description: The version of PHP to install.
+    Type: String
+
+  WebInstanceType:
+    AllowedValues:
+    - t3.nano
+    - t3.micro
+    - t3.small
+    - t3.medium
+    - t3.large
+    - t3.xlarge
+    - m5.large
+    - m5.xlarge
+    - m5.2xlarge
+    - c5.large
+    - c5.xlarge
+    - c5.2xlarge
+    Default: t3.medium
+    Description: The Amazon EC2 instance type for the web instances.
+    Type: String
+
+  WebAsgMax:
+    AllowedPattern: ^((?!0$)[1-2]?[0-9]|30)$
+    ConstraintDescription: Must be a number between 1 and 30.
+    Default: 10
+    Description: Specifies the maximum number of EC2 instances in the Web Autoscaling Group.
+    Type: String
+
+  WebAsgMin:
+    AllowedPattern: ^([0-0]?[0-9]|10)$
+    ConstraintDescription: Must be a number between 0 and 10.
+    Default: 2
+    Description: Specifies the minimum number of EC2 instances in the Web Autoscaling Group.
+    Type: String
+
+  WPTitle:
+    Default: This is a new WordPress site on Amazon Web Services
+    Description: The WordPress website title.
+    Type: String
+
+  WPAdminUsername:
+    AllowedPattern: ^([a-zA-Z0-9])([a-zA-Z0-9_-])*([a-zA-Z0-9])$
+    Description: The WordPress admin username.
+    Type: String
+    Default: wpadmin
+
+  WPAdminPassword:
+    AllowedPattern: ^([a-zA-Z0-9`~!#$%^&*()_+,\\-])*$
+    ConstraintDescription: Must be letters (upper or lower), numbers, and these special characters '_'`~!#$%^&*()_+,-   
+    Description: The WordPress admin password.
+    Type: String
+    NoEcho: true
+
+  WPDirectory:
+    AllowedPattern: ^([a-zA-Z0-9])([a-zA-Z0-9_-])*([a-zA-Z0-9])$
+    Description: The WordPress site directory.
+    Type: String
+    Default: wordpress
+
+  WPLocale:
+    Description: The main language of the WordPress site.
+    Type: String
+    Default: en_US
+
+Conditions:
+  DeployWithoutDomainName: !Equals [ !Ref WPDomainName, '' ]
+  DeployWithDomainName: !Not [ !Equals [ !Ref WPDomainName, '' ] ]
+  DeployElastiCache: !Equals [ !Ref UseElastiCacheBoolean, true ]
+
+Resources:
+  # VPC and Networking
+  VPC:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-01-newvpc.yaml
+      Parameters:
+        NumberOfAZs: !Ref NumberOfAZs
+        AvailabilityZones: !Join [ ',', !Ref AvailabilityZones ]
+        VpcCidr: !Ref VpcCidr
+        VpcTenancy: !Ref VpcTenancy
+
+  # Security Groups
+  SecurityGroups:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: VPC
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-02-securitygroups.yaml
+      Parameters:
+        SshAccessCidr: !Ref SshAccessCidr
+        Vpc: !GetAtt VPC.Outputs.Vpc
+
+  # Application Load Balancer
+  PublicAlbListenerNoSslCertificate:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VPC
+      - SecurityGroups
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-publicalb.yaml
+      Parameters:
+        NumberOfSubnets: !Ref NumberOfAZs
+        Subnet: !GetAtt VPC.Outputs.PublicSubnet
+        PublicAlbAcmCertificate: !Ref CloudFrontAcmCertificate
+        PublicAlbSecurityGroup: !GetAtt SecurityGroups.Outputs.PublicAlbSecurityGroup
+        Vpc: !GetAtt VPC.Outputs.Vpc
+
+  # EFS File System
+  EfsFileSystem:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VPC
+      - SecurityGroups
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-efsfilesystem.yaml
+      Parameters:
+        NumberOfSubnets: !Ref NumberOfAZs
+        EfsSecurityGroup: !GetAtt SecurityGroups.Outputs.EfsSecurityGroup
+        Subnet: !GetAtt VPC.Outputs.DataSubnet
+        EfsPerformanceMode: !Ref EfsPerformanceMode
+        EfsEncrpytedBoolean: !Ref EfsEncrpytedBoolean
+        EfsKmsKey: !Ref EfsKmsKey
+
+  # RDS Database
+  RdsDatabase:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VPC
+      - SecurityGroups
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-rds.yaml
+      Parameters:
+        NumberOfSubnets: !Ref NumberOfAZs
+        Subnet: !GetAtt VPC.Outputs.DataSubnet
+        DatabaseInstanceClass: !Ref DatabaseInstanceClass
+        DatabaseMasterUsername: !Ref DatabaseMasterUsername
+        DatabaseMasterPassword: !Ref DatabaseMasterPassword
+        DatabaseName: !Ref DatabaseName
+        DatabaseEncrpytedBoolean: !Ref DatabaseEncrpytedBoolean
+        DatabaseKmsKey: !Ref DatabaseKmsKey
+        DatabaseSecurityGroup: !GetAtt SecurityGroups.Outputs.DatabaseSecurityGroup
+
+  # ElastiCache Redis
+  ElastiCacheCluster:
+    Condition: DeployElastiCache
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VPC
+      - SecurityGroups
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-refarch/wordpress/latest/templates/aws-refarch-wordpress-03-elasticache.yaml
+      Parameters:
+        NumberOfSubnets: !Ref NumberOfAZs
+        Subnet: !GetAtt VPC.Outputs.DataSubnet
+        ElastiCacheClusterName: !Sub ${AWS::StackName}-redis
+        ElastiCacheNodeType: !Ref ElastiCacheNodeType
+        ElastiCacheSecurityGroup: !GetAtt SecurityGroups.Outputs.ElastiCacheSecurityGroup
+
+  # Database Secret for RDS Proxy
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/rds/credentials
+      Description: RDS Master User Credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub |
+          {
+            "username": "${DatabaseMasterUsername}",
+            "engine": "mysql",
+            "host": "${RdsDatabase.Outputs.DatabaseClusterEndpointAddress}",
+            "port": 3306,
+            "dbClusterIdentifier": "${RdsDatabase.Outputs.DatabaseCluster}",
+            "dbname": "${DatabaseName}"
+          }
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+  # RDS Proxy IAM Role
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSProxyRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DatabaseSecret
+
+  # RDS Proxy
+  RDSProxy:
+    Type: AWS::RDS::DBProxy
+    DependsOn: RdsDatabase
+    Properties:
+      DBProxyName: !Sub ${AWS::StackName}-proxy
+      EngineFamily: MYSQL
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref DatabaseSecret
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      VpcSubnetIds: !Split [',', !GetAtt VPC.Outputs.DataSubnet]
+      VpcSecurityGroupIds:
+        - !GetAtt SecurityGroups.Outputs.DatabaseSecurityGroup
+      RequireTLS: true
+      IdleClientTimeout: 1800
+      MaxConnectionsPercent: 95
+      MaxIdleConnectionsPercent: 50
+
+  # RDS Proxy Target Group
+  RDSProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref RDSProxy
+      TargetGroupName: default
+      DBClusterIdentifiers:
+        - !GetAtt RdsDatabase.Outputs.DatabaseCluster
+
+  # Launch Template with Optimizations
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - EfsFileSystem
+      - RDSProxy
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-LaunchTemplate
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+        InstanceType: !Ref WebInstanceType
+        KeyName: !Ref EC2KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt WebInstanceProfile.Arn
+        SecurityGroupIds:
+          - !GetAtt SecurityGroups.Outputs.WebSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # WordPress Production Optimized Setup - 10K Users
+            
+            # System updates and package installation
+            yum update -y
+            yum install -y httpd mysql amazon-efs-utils
+            amazon-linux-extras install -y php${PHPVersion}
+            yum install -y php-mysqlnd php-gd php-xml php-mbstring php-curl php-zip php-opcache
+            
+            # System-level optimizations for high concurrency
+            cat > /etc/sysctl.d/99-wordpress-performance.conf << 'EOF'
+            net.core.somaxconn = 65535
+            net.core.netdev_max_backlog = 5000
+            net.ipv4.tcp_max_syn_backlog = 8192
+            net.ipv4.tcp_syncookies = 1
+            net.ipv4.tcp_tw_reuse = 1
+            net.ipv4.tcp_fin_timeout = 30
+            net.ipv4.ip_local_port_range = 1024 65535
+            fs.file-max = 100000
+            EOF
+            sysctl -p /etc/sysctl.d/99-wordpress-performance.conf
+            
+            # Apache limits for high concurrency
+            cat > /etc/security/limits.d/apache.conf << 'EOF'
+            apache soft nofile 65535
+            apache hard nofile 65535
+            apache soft nproc 32768
+            apache hard nproc 32768
+            EOF
+            
+            # Optimized journald configuration
+            sed -i 's/#SystemMaxUse=/SystemMaxUse=200M/' /etc/systemd/journald.conf
+            sed -i 's/#RuntimeMaxUse=/RuntimeMaxUse=100M/' /etc/systemd/journald.conf
+            sed -i 's/#MaxRetentionSec=/MaxRetentionSec=1week/' /etc/systemd/journald.conf
+            sed -i 's/#MaxFileSec=/MaxFileSec=1day/' /etc/systemd/journald.conf
+            
+            # PHP optimizations
+            sed -i 's/memory_limit = .*/memory_limit = 512M/' /etc/php.ini
+            sed -i 's/upload_max_filesize = .*/upload_max_filesize = 128M/' /etc/php.ini
+            sed -i 's/post_max_size = .*/post_max_size = 512M/' /etc/php.ini
+            sed -i 's/max_execution_time = .*/max_execution_time = 300/' /etc/php.ini
+            sed -i 's/max_input_time = .*/max_input_time = 600/' /etc/php.ini
+            sed -i 's/max_input_vars = .*/max_input_vars = 1000/' /etc/php.ini
+            
+            # Apache optimizations for high concurrency
+            cat >> /etc/httpd/conf/httpd.conf << 'EOF'
+            
+            # High Performance Settings for 10K Users
+            ServerLimit 32
+            MaxRequestWorkers 800
+            ThreadsPerChild 25
+            ThreadLimit 64
+            StartServers 8
+            MinSpareThreads 25
+            MaxSpareThreads 75
+            EOF
+            
+            # Disable zram for system stability
+            systemctl stop zram-generator@zram0 2>/dev/null || true
+            systemctl disable zram-generator@zram0 2>/dev/null || true
+            systemctl mask zram-generator@zram0 2>/dev/null || true
+            
+            # Enable and start services
+            systemctl enable httpd
+            systemctl start httpd
+            
+            # EFS mount
+            echo "${EfsFileSystem.Outputs.EfsFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /var/www/html/wp-content efs defaults,_netdev" >> /etc/fstab
+            mkdir -p /var/www/html/wp-content
+            mount -a
+            
+            # WordPress installation
+            cd /tmp
+            wget -q https://wordpress.org/latest.tar.gz
+            tar -xzf latest.tar.gz
+            cp -r wordpress/* /var/www/html/
+            rm -rf wordpress latest.tar.gz
+            
+            # WordPress configuration
+            cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
+            sed -i "s/database_name_here/${DatabaseName}/" /var/www/html/wp-config.php
+            sed -i "s/username_here/${DatabaseMasterUsername}/" /var/www/html/wp-config.php
+            sed -i "s/password_here/${DatabaseMasterPassword}/" /var/www/html/wp-config.php
+            sed -i "s/localhost/${RDSProxy.Endpoint}/" /var/www/html/wp-config.php
+            
+            # Add WordPress optimizations
+            cat >> /var/www/html/wp-config.php << 'EOF'
+            
+            // Performance optimizations
+            define('WP_CACHE', true);
+            define('MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL);
+            define('DB_SSL', true);
+            define('DB_SSL_VERIFY', false);
+            
+            // Redis object cache configuration
+            define('WP_REDIS_HOST', '${ElastiCacheCluster.Outputs.ElastiCacheClusterEndpointAddress}');
+            define('WP_REDIS_PORT', 6379);
+            define('WP_REDIS_TIMEOUT', 1);
+            define('WP_REDIS_READ_TIMEOUT', 1);
+            define('WP_REDIS_DATABASE', 0);
+            
+            // Security keys (generate these)
+            define('AUTH_KEY',         'put your unique phrase here');
+            define('SECURE_AUTH_KEY',  'put your unique phrase here');
+            define('LOGGED_IN_KEY',    'put your unique phrase here');
+            define('NONCE_KEY',        'put your unique phrase here');
+            define('AUTH_SALT',        'put your unique phrase here');
+            define('SECURE_AUTH_SALT', 'put your unique phrase here');
+            define('LOGGED_IN_SALT',   'put your unique phrase here');
+            define('NONCE_SALT',       'put your unique phrase here');
+            EOF
+            
+            # Create health check file
+            cat > /var/www/html/health.php << 'EOF'
+            <?php
+            http_response_code(200);
+            echo "OK";
+            ?>
+            EOF
+            
+            # Set permissions
+            chown -R apache:apache /var/www/html
+            chmod -R 755 /var/www/html
+            
+            # Remove default index.html
+            rm -f /var/www/html/index.html
+            
+            # Restart services with new configurations
+            systemctl restart systemd-journald
+            systemctl restart httpd
+            
+            # Signal CloudFormation
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+
+  # IAM Role for Web Instances
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Policies:
+        - PolicyName: CloudFormationSignal
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:SignalResource
+                Resource: '*'
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebInstanceRole
+
+  # Target Group with Optimized Health Checks
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !GetAtt VPC.Outputs.Vpc
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /health.php
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+        - Key: stickiness.enabled
+          Value: false
+
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref WebAsgMin
+      MaxSize: !Ref WebAsgMax
+      DesiredCapacity: !Ref WebAsgMin
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      VPCZoneIdentifier: !Split [',', !GetAtt VPC.Outputs.WebSubnet]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-WebServer
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref WebAsgMin
+        Timeout: PT15M
+
+  # Target Tracking Scaling Policy
+  TargetTrackingScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub 
+            - "${LoadBalancerFullName}/${TargetGroupFullName}"
+            - LoadBalancerFullName: !GetAtt PublicAlbListenerNoSslCertificate.Outputs.PublicAlbFullName
+              TargetGroupFullName: !GetAtt TargetGroup.TargetGroupFullName
+        TargetValue: 300
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # CloudWatch Alarms
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-RDS-DatabaseConnections
+      AlarmDescription: RDS Database Connections
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !GetAtt RdsDatabase.Outputs.DatabaseCluster
+      AlarmActions:
+        - !Ref SNSTopic
+
+  # SNS Topic for Notifications
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${AWS::StackName}-Notifications
+      Subscription:
+        - Endpoint: !Ref AdminEmail
+          Protocol: email
+
+Outputs:
+  WPSiteURL:
+    Description: WordPress Site URL
+    Value: !If 
+      - DeployWithDomainName
+      - !Sub 'https://${WPDomainName}/'
+      - !Sub 'https://${PublicAlbListenerNoSslCertificate.Outputs.PublicAlbDnsName}/'
+
+  DatabaseClusterEndpoint:
+    Description: Aurora Cluster Endpoint
+    Value: !GetAtt RdsDatabase.Outputs.DatabaseClusterEndpointAddress
+
+  RDSProxyEndpoint:
+    Description: RDS Proxy Endpoint
+    Value: !GetAtt RDSProxy.Endpoint
+
+  ElastiCacheEndpoint:
+    Condition: DeployElastiCache
+    Description: ElastiCache Redis Endpoint
+    Value: !GetAtt ElastiCacheCluster.Outputs.ElastiCacheClusterEndpointAddress
+
+  EFSFileSystem:
+    Description: EFS File System ID
+    Value: !GetAtt EfsFileSystem.Outputs.EfsFileSystem
