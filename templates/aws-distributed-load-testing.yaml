@@ -497,10 +497,12 @@ Outputs:
 
   AdminInstructions:
     Description: Instructions for using the load testing solution
-    Value: !Sub |
-      1. Deploy this stack and wait for completion
-      2. Check your email (${AdminEmail}) for login credentials
-      3. Access the API endpoint to manage load tests
-      4. Configure test targeting: https://atl.direct
-      5. Monitor results in CloudWatch dashboard
-      6. Test engines will be launched in: ${TestRegions}
+    Value: !Sub 
+      - |
+        1. Deploy this stack and wait for completion
+        2. Check your email (${AdminEmail}) for login credentials
+        3. Access the API endpoint to manage load tests
+        4. Configure test targeting: https://atl.direct
+        5. Monitor results in CloudWatch dashboard
+        6. Test engines will be launched in: ${RegionList}
+      - RegionList: !Join [", ", !Ref TestRegions]
