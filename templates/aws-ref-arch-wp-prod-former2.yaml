@@ -1,0 +1,1120 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Production WordPress Architecture on AWS - Secure, Scalable, and Highly Available'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - AvailabilityZones
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DBInstanceClass
+          - DBMasterUsername
+          - DBMasterPassword
+          - DBName
+      - Label:
+          default: "Web Tier Configuration"
+        Parameters:
+          - WebInstanceType
+          - KeyPairName
+          - MinSize
+          - MaxSize
+          - DesiredCapacity
+      - Label:
+          default: "Domain & SSL"
+        Parameters:
+          - DomainName
+          - SSLCertificateArn
+          - CreateCloudFront
+      - Label:
+          default: "Monitoring & Alerts"
+        Parameters:
+          - NotificationEmail
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: wordpress
+    Description: Project name for resource naming
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for VPC
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  AvailabilityZones:
+    Type: CommaDelimitedList
+    Description: List of Availability Zones (minimum 2)
+    Default: "us-east-1a,us-east-1b"
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    AllowedValues: [db.t4g.medium, db.t4g.large, db.r6g.large, db.r6g.xlarge]
+    Description: RDS instance class
+
+  DBMasterUsername:
+    Type: String
+    Default: wpdbadmin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    Description: Database master username
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9]*'
+    Description: Database master password (8-41 characters)
+
+  DBName:
+    Type: String
+    Default: wordpress
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    Description: WordPress database name
+
+  WebInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, m5.large, m5.xlarge]
+    Description: EC2 instance type for web servers
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Minimum number of web servers
+
+  MaxSize:
+    Type: Number
+    Default: 6
+    MinValue: 2
+    MaxValue: 20
+    Description: Maximum number of web servers
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of web servers
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Domain name for WordPress site (optional)
+
+  SSLCertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM Certificate ARN for HTTPS (optional)
+
+  CreateCloudFront:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create CloudFront distribution
+
+  NotificationEmail:
+    Type: String
+    Description: Email for CloudWatch alarms
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+
+Conditions:
+  HasDomainName: !Not [!Equals [!Ref DomainName, ""]]
+  HasSSLCertificate: !Not [!Equals [!Ref SSLCertificateArn, ""]]
+  CreateCloudFrontDistribution: !Equals [!Ref CreateCloudFront, "true"]
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316
+    us-east-2:
+      AMI: ami-0f924dc71d44d23e2
+    us-west-1:
+      AMI: ami-0d382e80be7ffdae5
+    us-west-2:
+      AMI: ami-0c2d3e23d311bf99c
+    eu-west-1:
+      AMI: ami-0d71ea30463e0ff8d
+
+Resources:
+  # KMS Key for encryption
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${ProjectName}-${Environment} encryption key"
+      KeyPolicy:
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-kms-key"
+        - Key: Environment
+          Value: !Ref Environment
+
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-${Environment}"
+      TargetKeyId: !Ref KMSKey
+
+  # VPC and Networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-vpc"
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !Ref AvailabilityZones]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-subnet-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !Ref AvailabilityZones]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-subnet-2"
+
+  # Private Subnets for Web Tier
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !Ref AvailabilityZones]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-subnet-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !Ref AvailabilityZones]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-subnet-2"
+
+  # Database Subnets
+  DatabaseSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !Ref AvailabilityZones]
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-database-subnet-1"
+
+  DatabaseSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !Ref AvailabilityZones]
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-database-subnet-2"
+
+  # NAT Gateways
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-nat-eip-1"
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-nat-eip-2"
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-nat-1"
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-nat-2"
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-rt"
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-rt-1"
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-rt-2"
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  DatabaseRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-database-rt"
+
+  DatabaseSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref DatabaseRouteTable
+      SubnetId: !Ref DatabaseSubnet1
+
+  DatabaseSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref DatabaseRouteTable
+      SubnetId: !Ref DatabaseSubnet2
+
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-alb-sg"
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from internet
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-alb-sg"
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-web-sg"
+      GroupDescription: Security group for web servers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: SSH from bastion
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-web-sg"
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-database-sg"
+      GroupDescription: Security group for RDS database
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: MySQL from web servers
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-database-sg"
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-cache-sg"
+      GroupDescription: Security group for ElastiCache
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: Redis from web servers
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-cache-sg"
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-efs-sg"
+      GroupDescription: Security group for EFS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: NFS from web servers
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-efs-sg"
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-bastion-sg"
+      GroupDescription: Security group for bastion host
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH from internet (restrict in production)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-bastion-sg"
+
+  # S3 Buckets
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-media-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KMSKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-media"
+        - Key: Environment
+          Value: !Ref Environment
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-backup-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KMSKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              Days: 30
+              StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              Days: 90
+              StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backup"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EFS File System
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      CreationToken: !Sub "${ProjectName}-${Environment}-efs"
+      Encrypted: true
+      KmsKeyId: !Ref KMSKey
+      PerformanceMode: generalPurpose
+      ThroughputMode: provisioned
+      ProvisionedThroughputInMibps: 100
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-efs"
+        - Key: Environment
+          Value: !Ref Environment
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # Database Subnet Group
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS database
+      SubnetIds:
+        - !Ref DatabaseSubnet1
+        - !Ref DatabaseSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+
+  # RDS Aurora Cluster
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-${Environment}-cluster"
+      Engine: aurora-mysql
+      EngineVersion: 8.0.mysql_aurora.3.08.2
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DatabaseName: !Ref DBName
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      StorageEncrypted: true
+      KmsKeyId: !Ref KMSKey
+      EnableCloudwatchLogsExports:
+        - error
+        - slowquery
+      DeletionProtection: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-cluster"
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${Environment}-instance-1"
+      DBClusterIdentifier: !Ref DatabaseCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref KMSKey
+      PerformanceInsightsRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-instance-1"
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseInstance2:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${Environment}-instance-2"
+      DBClusterIdentifier: !Ref DatabaseCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref KMSKey
+      PerformanceInsightsRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-instance-2"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ElastiCache Subnet Group
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for ElastiCache
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  # ElastiCache Redis Cluster
+  CacheCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub "${ProjectName}-${Environment}-redis"
+      ReplicationGroupDescription: Redis cluster for WordPress caching
+      NumCacheClusters: 2
+      Engine: redis
+      CacheNodeType: cache.t4g.micro
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      MultiAZEnabled: true
+      AutomaticFailoverEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-redis"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for EC2 instances
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-web-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "${MediaBucket}/*"
+                  - !GetAtt MediaBucket.Arn
+                  - !Sub "${BackupBucket}/*"
+                  - !GetAtt BackupBucket.Arn
+        - PolicyName: EFSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: !Sub "arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EFSFileSystem}"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-web-role"
+        - Key: Environment
+          Value: !Ref Environment
+
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-${Environment}-web-profile"
+      Roles:
+        - !Ref WebServerRole
+
+  # Launch Template
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-${Environment}-web-template"
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+        InstanceType: !Ref WebInstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Arn: !GetAtt WebServerInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y amazon-cloudwatch-agent
+            
+            # Install Apache, PHP, and MySQL client
+            yum install -y httpd php php-mysqlnd php-gd php-xml php-mbstring php-json
+            
+            # Install EFS utils
+            yum install -y amazon-efs-utils
+            
+            # Mount EFS
+            mkdir -p /var/www/html/wp-content
+            echo "${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /var/www/html/wp-content efs defaults,_netdev" >> /etc/fstab
+            mount -a
+            
+            # Download and configure WordPress
+            cd /tmp
+            wget https://wordpress.org/latest.tar.gz
+            tar xzf latest.tar.gz
+            cp -r wordpress/* /var/www/html/
+            chown -R apache:apache /var/www/html
+            chmod -R 755 /var/www/html
+            
+            # Configure WordPress
+            cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
+            sed -i "s/database_name_here/${DBName}/" /var/www/html/wp-config.php
+            sed -i "s/username_here/${DBMasterUsername}/" /var/www/html/wp-config.php
+            sed -i "s/password_here/${DBMasterPassword}/" /var/www/html/wp-config.php
+            sed -i "s/localhost/${DatabaseCluster.Endpoint.Address}/" /var/www/html/wp-config.php
+            
+            # Start services
+            systemctl enable httpd
+            systemctl start httpd
+            
+            # Install CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c ssm:AmazonCloudWatch-linux
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ProjectName}-${Environment}-web-server"
+              - Key: Environment
+                Value: !Ref Environment
+
+  # Auto Scaling Group
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-${Environment}-asg"
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-web-server"
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-alb"
+        - Key: Environment
+          Value: !Ref Environment
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-tg"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-tg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasSSLCertificate
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref SSLCertificateArn
+
+  # Bastion Host
+  BastionLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-${Environment}-bastion-template"
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+        InstanceType: t3.nano
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref BastionSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y mysql
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ProjectName}-${Environment}-bastion"
+              - Key: Environment
+                Value: !Ref Environment
+
+  BastionAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-${Environment}-bastion-asg"
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BastionLaunchTemplate
+        Version: !GetAtt BastionLaunchTemplate.LatestVersionNumber
+      MinSize: 0
+      MaxSize: 1
+      DesiredCapacity: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-bastion"
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: CreateCloudFrontDistribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName}-${Environment} WordPress CDN"
+        DefaultRootObject: index.php
+        Origins:
+          - Id: ALBOrigin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          ForwardedValues:
+            QueryString: true
+            Headers: [Host, CloudFront-Forwarded-Proto]
+            Cookies:
+              Forward: all
+        PriceClass: PriceClass_100
+        Aliases: !If
+          - HasDomainName
+          - [!Ref DomainName]
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasSSLCertificate
+          - AcmCertificateArn: !Ref SSLCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-cloudfront"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Alerts
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-alerts"
+      DisplayName: !Sub "${ProjectName} ${Environment} Alerts"
+      KmsMasterKeyId: !Ref KMSKey
+
+  AlertsTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-high-cpu"
+      AlarmDescription: High CPU utilization
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebServerAutoScalingGroup
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-database-high-cpu"
+      AlarmDescription: High database CPU utilization
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref DatabaseCluster
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  ALBTargetHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-unhealthy-targets"
+      AlarmDescription: Unhealthy ALB targets
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt ALBTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      AlarmActions:
+        - !Ref AlertsTopic
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-vpc-id"
+
+  DatabaseEndpoint:
+    Description: RDS Aurora cluster endpoint
+    Value: !GetAtt DatabaseCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-db-endpoint"
+
+  LoadBalancerDNS:
+    Description: Application Load Balancer DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-alb-dns"
+
+  CloudFrontDomainName:
+    Condition: CreateCloudFrontDistribution
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-cloudfront-domain"
+
+  EFSFileSystemId:
+    Description: EFS File System ID
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-efs-id"
+
+  MediaBucketName:
+    Description: S3 Media bucket name
+    Value: !Ref MediaBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-media-bucket"
+
+  BackupBucketName:
+    Description: S3 Backup bucket name
+    Value: !Ref BackupBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-backup-bucket"

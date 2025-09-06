@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda to read CloudFront logs from Kinesis and write to existing CloudWatch log group
+
+Parameters:
+  KinesisStreamArn:
+    Type: String
+    Default: arn:aws:kinesis:us-east-1:213202692866:stream/COA-WP-Prod-DataStream-Logs
+    Description: ARN of the Kinesis stream with CloudFront logs
+
+Resources:
+  # Lambda function to process Kinesis records
+  KinesisToCloudWatchLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: kinesis-to-cloudwatch-logs
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import base64
+          from datetime import datetime
+          
+          logs_client = boto3.client('logs')
+          
+          def lambda_handler(event, context):
+              log_group = '/aws/kinesisfirehose/cf-realtime-to-s3'
+              log_stream = 'cloudfront-realtime-logs'
+              
+              # Create log stream if it doesn't exist
+              try:
+                  logs_client.create_log_stream(
+                      logGroupName=log_group,
+                      logStreamName=log_stream
+                  )
+              except logs_client.exceptions.ResourceAlreadyExistsException:
+                  pass
+              except Exception as e:
+                  print(f"Error creating log stream: {e}")
+              
+              log_events = []
+              for record in event['Records']:
+                  try:
+                      # Decode Kinesis data
+                      payload = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                      
+                      # Use Kinesis timestamp or current time
+                      timestamp = int(record['kinesis']['approximateArrivalTimestamp'] * 1000)
+                      
+                      log_events.append({
+                          'timestamp': timestamp,
+                          'message': payload.strip()
+                      })
+                  except Exception as e:
+                      print(f"Error processing record: {e}")
+              
+              # Send to CloudWatch Logs
+              if log_events:
+                  try:
+                      logs_client.put_log_events(
+                          logGroupName=log_group,
+                          logStreamName=log_stream,
+                          logEvents=log_events
+                      )
+                      print(f"Sent {len(log_events)} log events to CloudWatch")
+                  except Exception as e:
+                      print(f"Error sending to CloudWatch: {e}")
+              
+              return {'statusCode': 200, 'body': f'Processed {len(log_events)} records'}
+
+  # Lambda execution role
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisAndCloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !Ref KinesisStreamArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - arn:aws:logs:*:*:log-group:/aws/kinesisfirehose/cf-realtime-to-s3
+                  - arn:aws:logs:*:*:log-group:/aws/kinesisfirehose/cf-realtime-to-s3:*
+
+  # Event source mapping to trigger Lambda from Kinesis
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref KinesisStreamArn
+      FunctionName: !Ref KinesisToCloudWatchLambda
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref KinesisToCloudWatchLambda
+  
+  LogGroupLocation:
+    Description: CloudWatch log group where logs will appear
+    Value: /aws/kinesisfirehose/cf-realtime-to-s3

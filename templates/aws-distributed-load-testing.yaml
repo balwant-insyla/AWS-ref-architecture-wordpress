@@ -140,12 +140,12 @@ Resources:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource:
-                  - !Sub "${ResultsBucket.Arn}/*"
+                  - !Sub "arn:aws:s3:::${ResultsBucket}/*"
               - Effect: Allow
                 Action:
                   - s3:ListBucket
                 Resource:
-                  - !GetAtt ResultsBucket.Arn
+                  - !Sub "arn:aws:s3:::${ResultsBucket}"
               - Effect: Allow
                 Action:
                   - ec2:DescribeRegions
@@ -183,7 +183,7 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                 Resource:
-                  - !Sub "${ResultsBucket.Arn}/*"
+                  - !Sub "arn:aws:s3:::${ResultsBucket}/*"
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
@@ -225,9 +225,6 @@ Resources:
           from datetime import datetime
           
           def lambda_handler(event, context):
-              """
-              Main handler for load test management
-              """
               try:
                   action = event.get('action', 'list')
                   
@@ -242,7 +239,13 @@ Resources:
                   elif action == 'results':
                       return get_test_results(event)
                   else:
-                      return list_tests()
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': 'Load Test Manager',
+                              'actions': ['create', 'start', 'stop', 'status', 'results']
+                          })
+                      }
                       
               except Exception as e:
                   return {
@@ -251,7 +254,6 @@ Resources:
                   }
           
           def create_test(event):
-              """Create a new load test configuration"""
               dynamodb = boto3.resource('dynamodb')
               table = dynamodb.Table(os.environ['CONFIG_TABLE'])
               
@@ -276,6 +278,532 @@ Resources:
                       'testId': test_id,
                       'message': 'Test configuration created successfully'
                   })
+              }
+          
+          def start_test(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              config_table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, started_at = :started_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'running',
+                      ':started_at': datetime.utcnow().isoformat()
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Test started successfully'})
+              }
+          
+          def stop_test(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              config_table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, stopped_at = :stopped_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'stopped',
+                      ':stopped_at': datetime.utcnow().isoformat()
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Test stopped successfully'})
+              }
+          
+          def get_test_status(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              response = config_table.get_item(Key={'testId': test_id})
+              if 'Item' not in response:
+                  return {
+                      'statusCode': 404,
+                      'body': json.dumps({'error': 'Test not found'})
+                  }
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Item'], default=str)
+              }
+          
+          def get_test_results(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              results_table = dynamodb.Table(os.environ['RESULTS_TABLE'])
+              
+              response = results_table.query(
+                  KeyConditionExpression='testId = :testId',
+                  ExpressionAttributeValues={':testId': test_id}
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'results': response.get('Items', [])})
+              }
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              config_table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, started_at = :started_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'running',
+                      ':started_at': datetime.utcnow().isoformat()
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Test started successfully'})
+              }
+          
+          def stop_test(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              config_table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, stopped_at = :stopped_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'stopped',
+                      ':stopped_at': datetime.utcnow().isoformat()
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Test stopped successfully'})
+              }
+          
+          def get_test_status(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              response = config_table.get_item(Key={'testId': test_id})
+              if 'Item' not in response:
+                  return {
+                      'statusCode': 404,
+                      'body': json.dumps({'error': 'Test not found'})
+                  }
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Item'], default=str)
+              }
+          
+          def get_test_results(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              results_table = dynamodb.Table(os.environ['RESULTS_TABLE'])
+              
+              response = results_table.query(
+                  KeyConditionExpression='testId = :testId',
+                  ExpressionAttributeValues={':testId': test_id}
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'results': response.get('Items', [])})
+              }
+          
+          def list_tests():
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              response = config_table.scan()
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'tests': response.get('Items', [])})
+              }
+
+  # VPC for test engines
+  TestVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  TestSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TestVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-subnet"
+
+  TestIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref TestVPC
+      InternetGatewayId: !Ref TestIGW
+
+  TestRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TestVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-rt"
+
+  TestRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref TestRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref TestIGW
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TestSubnet
+      RouteTableId: !Ref TestRouteTable
+
+  # Security Group
+  TestEngineSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for load test engines
+      VpcId: !Ref TestVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  # Launch Template for Test Engines
+  TestEngineLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-test-engine"
+      LaunchTemplateData:
+        ImageId: ami-0c02fb55956c7d316
+        InstanceType: t3.medium
+        IamInstanceProfile:
+          Arn: !GetAtt TestEngineInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref TestEngineSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd-tools python3 pip
+            pip3 install boto3 requests
+            
+            cat > /home/ec2-user/load_test.py << 'EOF'
+            #!/usr/bin/env python3
+            import boto3
+            import subprocess
+            import json
+            import time
+            from datetime import datetime
+            
+            def run_load_test(url, concurrent, duration):
+                cmd = ['ab', '-c', str(concurrent), '-t', str(duration), url]
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration+60)
+                    return {'stdout': result.stdout, 'stderr': result.stderr, 'returncode': result.returncode}
+                except Exception as e:
+                    return {'error': str(e)}
+            
+            def upload_results(test_id, results):
+                dynamodb = boto3.resource('dynamodb')
+                table = dynamodb.Table('${TestResultsTable}')
+                table.put_item(Item={
+                    'testId': test_id,
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'results': json.dumps(results),
+                    'region': boto3.Session().region_name
+                })
+            
+            def main():
+                dynamodb = boto3.resource('dynamodb')
+                table = dynamodb.Table('${TestConfigTable}')
+                
+                while True:
+                    try:
+                        response = table.scan(
+                            FilterExpression='#status = :status',
+                            ExpressionAttributeNames={'#status': 'status'},
+                            ExpressionAttributeValues={':status': 'running'}
+                        )
+                        if response['Items']:
+                            config = response['Items'][0]
+                            break
+                    except:
+                        pass
+                    time.sleep(10)
+                
+                results = run_load_test(config['target_url'], config['concurrent_users'], config['duration'])
+                upload_results(config['testId'], results)
+                subprocess.run(['sudo', 'shutdown', '-h', '+5'])
+            
+            if __name__ == '__main__':
+                main()
+            EOF
+            
+            chmod +x /home/ec2-user/load_test.py
+            nohup python3 /home/ec2-user/load_test.py > /var/log/load_test.log 2>&1 &
+
+  # API Gateway
+  LoadTestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      Description: Load Testing API
+
+  APIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref LoadTestAPI
+      ParentId: !GetAtt LoadTestAPI.RootResourceId
+      PathPart: test
+
+  APIMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref LoadTestAPI
+      ResourceId: !Ref APIResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LoadTestManagerFunction.Arn}/invocations"
+
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: APIMethod
+    Properties:
+      RestApiId: !Ref LoadTestAPI
+      StageName: prod
+
+  APILambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LoadTestManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LoadTestAPI}/*/*"
+
+  # SNS for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-notifications"
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+Outputs:
+  APIEndpoint:
+    Description: API Gateway endpoint for load testing
+    Value: !Sub "https://${LoadTestAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/test"
+    
+  LambdaFunction:
+    Description: Lambda function name for direct testing
+    Value: !Ref LoadTestManagerFunction
+    
+  ConfigTable:
+    Description: DynamoDB config table
+    Value: !Ref TestConfigTable
+    
+  ResultsTable:
+    Description: DynamoDB results table
+    Value: !Ref TestResultsTable
+    
+  Instructions:
+    Description: How to use the load testing solution
+    Value: !Sub |
+      API Usage:
+      1. Create: POST {"action":"create","target_url":"https://atl.direct","concurrent_users":100,"duration":300}
+      2. Start: POST {"action":"start","testId":"your-test-id"}
+      3. Status: POST {"action":"status","testId":"your-test-id"}
+      4. Results: POST {"action":"results","testId":"your-test-id"}
+      5. Stop: POST {"action":"stop","testId":"your-test-id"}
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              # Update test status to running
+              config_table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, started_at = :started_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'running',
+                      ':started_at': datetime.utcnow().isoformat()
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Test started successfully'})
+              }
+          
+          def stop_test(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              config_table.update_item(
+                  Key={'testId': test_id},
+                  UpdateExpression='SET #status = :status, stopped_at = :stopped_at',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': 'stopped',
+                      ':stopped_at': datetime.utcnow().isoformat()
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Test stopped successfully'})
+              }
+          
+          def get_test_status(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              response = config_table.get_item(Key={'testId': test_id})
+              if 'Item' not in response:
+                  return {
+                      'statusCode': 404,
+                      'body': json.dumps({'error': 'Test not found'})
+                  }
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Item'])
+              }
+          
+          def get_test_results(event):
+              test_id = event.get('testId')
+              if not test_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'testId required'})
+                  }
+              
+              dynamodb = boto3.resource('dynamodb')
+              results_table = dynamodb.Table(os.environ['RESULTS_TABLE'])
+              
+              response = results_table.query(
+                  KeyConditionExpression='testId = :testId',
+                  ExpressionAttributeValues={':testId': test_id}
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'results': response.get('Items', [])})
+              }
+          
+          def list_tests():
+              dynamodb = boto3.resource('dynamodb')
+              config_table = dynamodb.Table(os.environ['CONFIG_TABLE'])
+              
+              response = config_table.scan()
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'tests': response.get('Items', [])})
               }
           
           def start_test(event):
